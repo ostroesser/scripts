@@ -9,7 +9,7 @@ No LLM, nothing leaves your machine.
 ```bash
 python3 -m venv ~/docrag-venv && source ~/docrag-venv/bin/activate
 pip install torch --index-url https://download.pytorch.org/whl/cpu   # CPU-only torch, much smaller
-pip install sentence-transformers numpy
+pip install -U "sentence-transformers>=2.7" "transformers>=4.51" numpy
 ```
 
 ## Build the index
@@ -53,12 +53,26 @@ DOCRAG_INDEX=./idx-all python docrag.py ingest docs/*.txt mm_export/*.jsonl --re
 
 The index goes to `./docrag_index` (change it with `DOCRAG_INDEX=/some/dir`).
 
-The first run downloads the embedding model (~470 MB, `intfloat/multilingual-e5-small`, FR+EN).
-After that, docrag loads it from the local cache in offline mode, without contacting Hugging Face.
-Set `DOCRAG_OFFLINE=1` to never go online, even when the model is missing.
+## Models
+
+| Role | Default | Why |
+|---|---|---|
+| Embedding (`--model` at ingest) | `Qwen/Qwen3-Embedding-0.6B` | Best open model under 1B parameters for English retrieval (MTEB v2 retrieval 61.8, vs ~54 for the best small models). Apache 2.0. |
+| Reranker (`--reranker`) | `Qwen/Qwen3-Reranker-0.6B` | Re-reads the 20 best sections of each search and reorders them. Apache 2.0. |
+
+- **Indexing is CPU-heavy** with this model: the first full ingest of a large chat history can
+  take an hour or more on a laptop. Later ingests only embed new or changed sections.
+- **An existing index keeps the model it was built with**, so changing the model means a full
+  re-ingest (vectors from different models can't be mixed). To stay on a lighter model:
+  `ingest --model BAAI/bge-small-en-v1.5` (fast, English) or `--model intfloat/multilingual-e5-small`.
+- **Reranking** adds a few seconds per search on CPU. Turn it off per search with the
+  **Ranking** switch on the web page (Fast/Precise) or `ask --no-rerank`, or entirely with
+  `serve --no-rerank`. If the reranker can't be loaded, searches still work, with a warning.
+- Models are downloaded on first use (about 1.2 GB each). After that they load from the local
+  cache in offline mode, without contacting Hugging Face. `DOCRAG_OFFLINE=1` forbids downloads.
 **Certificate errors** during `pip install` or the model download: run
 `bash ../wsl-certs/import-windows-certs.sh` once. **Still blocked?** If the download is refused, get the model folder once
-from Hugging Face and pass its local path: `--model /path/to/multilingual-e5-small`.
+from Hugging Face and pass its local path: `--model /path/to/model-folder` (same for `--reranker`).
 
 ## Use it
 
@@ -106,11 +120,12 @@ The page talks to two endpoints you can also script against: `GET /api/sources` 
   (`--max-chars`, or the size field on the web page, default 24,000 characters ≈ 6k tokens).
   Small pages get what they need first, and the space left goes to the bigger ones. A page that fits its share is sent whole. Otherwise only its most relevant sections
   are sent, marked "(relevant extracts)". Raise the budget to get long chat threads whole.
-- **Search runs on sections, not whole pages.** The embedding model only reads ~512 tokens, so
+- **Search runs on sections, not whole pages.** Sections are capped at 512 tokens, so
   embedding a whole page would ignore most of it. Each page is cut on its headings for
   matching, and the hits are grouped back by page.
 - **Hybrid search.** Exact terms (image names like `rhel9-base`, property keys, error codes) are
-  matched by keywords, and paraphrased questions by meaning.
+  matched by keywords, and paraphrased questions by meaning. The reranker then re-reads the
+  20 best sections with the question and puts the ones that actually answer it first.
 - **Doc titles lose the site name** that doc sites append to every page ("Page - Site"),
   when every page of an export has the same suffix.
 - **Markdown links are reduced to their label** (`[Java Images](https://…)` → `Java Images`).

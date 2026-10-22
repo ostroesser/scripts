@@ -80,7 +80,7 @@ main { max-width: 980px; margin: 0 auto; padding: 0 24px 64px; }
 
 /* ---------- filters */
 .filters {
-  display: grid; grid-template-columns: minmax(260px, 1fr) auto auto auto;
+  display: grid; grid-template-columns: minmax(260px, 1fr) auto auto auto auto;
   gap: 14px 22px; align-items: end; margin-top: 18px;
 }
 .field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
@@ -101,6 +101,21 @@ main { max-width: 980px; margin: 0 auto; padding: 0 24px 64px; }
   width: 32px; border: 0; background: transparent; color: var(--muted); font-size: 18px; cursor: pointer;
 }
 .step:hover { color: var(--ink); background: var(--fog); }
+
+.switch { display: inline-flex; align-items: center; gap: 8px; height: 38px; cursor: pointer; }
+.switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.switch .track {
+  position: relative; width: 34px; height: 20px; border-radius: 10px;
+  background: var(--line); transition: background .15s;
+}
+.switch .track::after {
+  content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%;
+  background: var(--paper); box-shadow: 0 1px 2px rgba(0, 0, 0, .25); transition: transform .15s;
+}
+.switch input:checked + .track { background: var(--ink); }
+.switch input:checked + .track::after { transform: translateX(14px); }
+.switch input:focus-visible + .track { outline: 2px solid var(--focus); outline-offset: 2px; }
+.switch-text { font-size: 14px; min-width: 52px; }
 
 .field-size { min-width: 210px; }
 .field-size input[type=range] { width: 100%; accent-color: var(--ink); height: 20px; margin: 0; }
@@ -207,7 +222,7 @@ main { max-width: 980px; margin: 0 auto; padding: 0 24px 64px; }
 
 @media (max-width: 760px) {
   main, .top { padding-left: 16px; padding-right: 16px; }
-  .filters { grid-template-columns: 1fr 1fr; }
+  .filters { grid-template-columns: 1fr 1fr 1fr; }
   .field-sources, .field-size { grid-column: 1 / -1; }
   .ask textarea { font-size: 24px; }
   .packet-bar { flex-direction: column; align-items: stretch; }

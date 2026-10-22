@@ -195,7 +195,7 @@ const combo = {
 };
 
 // ------------------------------------------------------------------ filters
-const q = $("q"), since = $("since"), k = $("k"), size = $("size");
+const q = $("q"), since = $("since"), k = $("k"), size = $("size"), rerank = $("rerank");
 
 function autoGrow() { q.style.height = "auto"; q.style.height = q.scrollHeight + "px"; }
 function showSize() {
@@ -203,7 +203,10 @@ function showSize() {
   $("size-out").textContent = `${fmtK(v)} characters, about ${fmtK(tokens(v))} tokens`;
 }
 function persist() {
-  save({ src: state.selected, since: since.value, k: k.value, size: size.value });
+  save({ src: state.selected, since: since.value, k: k.value, size: size.value, rerank: rerank.checked });
+}
+function showRerank() {
+  $("rerank-text").textContent = rerank.checked ? "Precise" : "Fast";
 }
 function clampK() { k.value = Math.max(1, Math.min(50, parseInt(k.value, 10) || 5)); }
 
@@ -212,7 +215,7 @@ async function search() {
   const question = q.value.trim();
   if (!question) { q.focus(); return; }
   clampK();
-  const params = new URLSearchParams({ q: question, k: k.value, size: size.value });
+  const params = new URLSearchParams({ q: question, k: k.value, size: size.value, rerank: rerank.checked ? "1" : "0" });
   if (since.value) params.set("since", since.value);
   state.selected.forEach((s) => params.append("src", s));
   history.replaceState(null, "", "?" + params.toString());
@@ -221,13 +224,18 @@ async function search() {
   const go = $("go");
   go.disabled = true;
   go.textContent = "Searching…";
-  const slow = setTimeout(() => notice("Loading the search model. The first search takes a few seconds."), 1500);
+  const slow = setTimeout(() => notice(rerank.checked
+    ? "Searching and re-reading the best matches. The first search also loads the models."
+    : "Searching. The first search also loads the model."), 1500);
   try {
     const r = await fetch("/api/search?" + params.toString());
     const data = await r.json();
     if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
     state.results = data.results;
     state.header = data.header;
+    state.seconds = data.seconds;
+    state.reranked = data.reranked;
+    state.warning = data.warning;
     state.off = new Set();
     renderResults();
   } catch (e) {
@@ -260,7 +268,7 @@ function displayTitle(r) {
 function renderResults() {
   const list = $("results");
   list.replaceChildren();
-  notice("");
+  notice(state.warning ? `Results without precise ranking: ${state.warning}` : "", !!state.warning);
   $("packet").hidden = !state.results.length;
   if (!state.results.length) {
     if (q.value.trim()) notice("No pages match. Remove a source, or move the chat date further back.");
@@ -327,7 +335,8 @@ function renderPacket() {
   t.replaceChildren();
   const strong = el("strong", null, `${kept.length} of ${state.results.length} pages`);
   t.append(strong, document.createTextNode(
-    `, ${fmtK(total)} characters, about ${fmtK(tokens(total))} tokens (size ${fmtK(budget)})`));
+    `, ${fmtK(total)} characters, about ${fmtK(tokens(total))} tokens (size ${fmtK(budget)})`
+    + (state.seconds != null ? `. Found in ${state.seconds.toFixed(1)} s${state.reranked ? " with precise ranking" : ""}.` : "")));
   $("copy").disabled = !kept.length;
 }
 
@@ -358,6 +367,8 @@ async function init() {
   since.value = url.get("since") ?? saved.since ?? "";
   k.value = url.get("k") || saved.k || 5;
   size.value = url.get("size") || saved.size || 24000;
+  rerank.checked = url.has("rerank") ? url.get("rerank") !== "0" : saved.rerank !== false;
+  showRerank();
   state.selected = url.getAll("src").length ? url.getAll("src") : (saved.src || []);
   autoGrow();
   showSize();
@@ -377,11 +388,13 @@ async function init() {
   since.addEventListener("change", persist);
   size.addEventListener("input", () => { showSize(); if (state.results.length) renderPacket(); });
   size.addEventListener("change", persist);
+  rerank.addEventListener("change", () => { showRerank(); persist(); });
 
   try {
     const r = await fetch("/api/sources");
     const data = await r.json();
     state.sources = data.sources;
+    if (!data.reranker) $("rerank-field").hidden = true;   // server started with --no-rerank
     const known = new Set(state.sources.map((s) => s.key).concat(Object.values(ALL)));
     state.selected = state.selected.filter((key) => known.has(key));
     const nDocs = state.sources.filter((s) => s.kind === "docs").length;

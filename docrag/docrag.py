@@ -19,7 +19,7 @@ plus local embeddings for meaning, merged with reciprocal rank fusion.
 Matching runs on sections, so long pages are not truncated by the embedding
 model. Nothing leaves your machine, and no LLM is involved.
 """
-import argparse, html, json, math, os, re, subprocess, sys, tempfile
+import argparse, html, json, math, os, re, subprocess, sys, tempfile, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -27,7 +27,10 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 
 INDEX_DIR = Path(os.environ.get("DOCRAG_INDEX", "./docrag_index"))
-DEFAULT_MODEL = "intfloat/multilingual-e5-small"   # FR+EN, runs fine on CPU
+DEFAULT_MODEL = "Qwen/Qwen3-Embedding-0.6B"        # best open model < 1B for English retrieval
+DEFAULT_RERANKER = "Qwen/Qwen3-Reranker-0.6B"      # re-reads the best sections, reorders them
+RERANK_CANDIDATES = 20                             # sections the reranker re-reads per question
+MAX_TOKENS = 512                                   # sections are short; caps CPU time per section
 MAX_CHUNK = 1800       # chars per searchable section (the model reads ~512 tokens)
 MIN_CHUNK = 250        # tiny sections get merged with their neighbour
 MAX_CHARS = 24000      # default total size budget of one answer (~6k tokens)
@@ -236,7 +239,7 @@ class BM25:
 
 
 class Index:
-    def __init__(self, path=INDEX_DIR):
+    def __init__(self, path=INDEX_DIR, reranker=DEFAULT_RERANKER):
         meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
         self.pages = [page_meta(p) for p in json.loads((path / "pages.json").read_text(encoding="utf-8"))]
         self.chunks = json.loads((path / "chunks.json").read_text(encoding="utf-8"))
@@ -247,6 +250,13 @@ class Index:
             self.page_chunks[c["page"]] = self.page_chunks.get(c["page"], 0) + 1
         self.bm25 = BM25([tokenize(self.chunk_header(c) + " " + c["text"]) for c in self.chunks])
         self._model = None
+        self.reranker_name = reranker             # None: no reranking
+        self._reranker = None
+        self.rerank_error = None
+        self.last_reranked = False
+        NEEDED_MODELS.add(self.model_name)
+        if reranker:
+            NEEDED_MODELS.add(reranker)
 
     def sources(self):
         """Filterable sources: one entry per docs export file and per chat channel."""
@@ -267,7 +277,17 @@ class Index:
             self._model = load_model(self.model_name)
         return self._model
 
-    def search(self, question, k=5, max_chars=None, since=None, source=None, groups=None):
+    def reranker(self):
+        """The reranker, loaded on first use; None if it can't be loaded (search still works)."""
+        if self._reranker is None and self.rerank_error is None and self.reranker_name:
+            try:
+                self._reranker = Reranker(self.reranker_name)
+            except (Exception, SystemExit) as e:
+                self.rerank_error = f"reranker {self.reranker_name} unavailable ({type(e).__name__}: {e})"
+                print("warning:", self.rerank_error, file=sys.stderr)
+        return self._reranker
+
+    def search(self, question, k=5, max_chars=None, since=None, source=None, groups=None, rerank=False):
         """Return up to k pages: whole when small enough, else only their matching sections.
         since:  chat threads only: keep those active on/after YYYY-MM-DD (docs are not affected).
         source: keep pages whose source, label or file name contains this text.
@@ -297,8 +317,19 @@ class Index:
             order = np.argsort(-scores)
             rrf[order] += 1.0 / (60 + np.arange(1, len(idx) + 1))
 
+        ranked = idx[np.argsort(-rrf)]
+        self.last_reranked = False
+        if rerank and len(ranked) > 1:         # re-read the best candidates and reorder them
+            rr = self.reranker()
+            if rr is not None:
+                head = ranked[:RERANK_CANDIDATES]
+                scores = rr.score(question, [f"{self.chunk_header(self.chunks[i])}\n{self.chunks[i]['text']}"
+                                             for i in head])
+                ranked = np.concatenate([head[np.argsort(-scores, kind="stable")], ranked[RERANK_CANDIDATES:]])
+                self.last_reranked = True
+
         hits = {}                              # k best pages -> all their chunks, most relevant first
-        for i in idx[np.argsort(-rrf)]:
+        for i in ranked:
             pid = self.chunks[i]["page"]
             if pid not in hits:
                 if len(hits) >= k:
@@ -365,28 +396,110 @@ def model_is_cached(name):
     return snapshots.is_dir() and any(snapshots.iterdir())
 
 
-def load_model(name):
-    """Load the embedding model without touching the network when it's already on disk.
-    Downloads it only if missing, unless DOCRAG_OFFLINE=1."""
+NEEDED_MODELS = set()      # every model this run will load (embedding + reranker)
+
+
+def prepare_hf(name):
+    """Decide offline/online once, before the Hugging Face libraries are imported (they read the
+    setting at import): offline when every model this run needs is on disk, else download."""
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    NEEDED_MODELS.add(name)
     cached = model_is_cached(name)
-    if cached:                                  # must be set before the HF libraries are imported
+    if "transformers" not in sys.modules and all(model_is_cached(n) for n in NEEDED_MODELS):
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    elif os.environ.get("DOCRAG_OFFLINE") == "1":
-        sys.exit(f"Model {name} is not downloaded and DOCRAG_OFFLINE=1. "
-                 "Run once without it, or pass --model /path/to/a/local/model/folder.")
-    else:
+    if not cached:
+        if os.environ.get("DOCRAG_OFFLINE") == "1":
+            sys.exit(f"Model {name} is not downloaded and DOCRAG_OFFLINE=1. "
+                     "Run once without it, or pass a local model folder.")
         print(f"Model {name} not found locally, downloading it from Hugging Face …", file=sys.stderr)
+    return cached
+
+
+def load_model(name):
+    """Load the embedding model, without touching the network when it's already on disk."""
+    cached = prepare_hf(name)
     from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(name, local_files_only=cached)
+    model = SentenceTransformer(name, local_files_only=cached)
+    if getattr(model, "max_seq_length", None):
+        model.max_seq_length = min(model.max_seq_length, MAX_TOKENS)
+    return model
+
+
+# Query/passage conventions differ per model family. Documents never get an instruction.
+QWEN_QUERY = ("Instruct: Given a technical question, retrieve documentation pages and chat "
+              "discussions that answer it\nQuery:")
+
+
+def prompts_for(name):
+    n = name.lower()
+    if "qwen3-embedding" in n:
+        return QWEN_QUERY, ""
+    if "e5" in n:
+        return "query: ", "passage: "
+    if "bge-" in n and "en-v1.5" in n:
+        return "Represent this sentence for searching relevant passages: ", ""
+    return "", ""
 
 
 def embed(model, name, texts, is_query=False):
-    if "e5" in name.lower():                   # e5 models expect these prefixes
-        texts = [("query: " if is_query else "passage: ") + t for t in texts]
-    v = model.encode(texts, batch_size=32, show_progress_bar=not is_query, normalize_embeddings=True)
+    query_prefix, passage_prefix = prompts_for(name)
+    prefix = query_prefix if is_query else passage_prefix
+    if prefix:
+        texts = [prefix + t for t in texts]
+    v = model.encode(texts, batch_size=16, show_progress_bar=not is_query, normalize_embeddings=True)
     return np.asarray(v, dtype=np.float32)
+
+
+class Reranker:
+    """Scores (question, section) pairs; higher is more relevant.
+    Qwen3-Reranker is a small LM asked "does this document answer the query? yes/no" (the method
+    from its model card, independent of the sentence-transformers version); other rerankers go
+    through sentence-transformers' CrossEncoder."""
+    INSTRUCT = "Given a technical question, judge whether the passage helps answer it"
+
+    def __init__(self, name):
+        self.name = name
+        cached = prepare_hf(name)
+        self.qwen = "qwen3-reranker" in name.lower()
+        if self.qwen:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            self.torch = torch
+            self.tok = AutoTokenizer.from_pretrained(name, padding_side="left", local_files_only=cached)
+            self.lm = AutoModelForCausalLM.from_pretrained(name, local_files_only=cached).eval()
+            self.yes = self.tok.convert_tokens_to_ids("yes")
+            self.no = self.tok.convert_tokens_to_ids("no")
+            self.prefix = self.tok.encode(
+                "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query "
+                "and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n"
+                "<|im_start|>user\n", add_special_tokens=False)
+            self.suffix = self.tok.encode("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                                          add_special_tokens=False)
+        else:
+            from sentence_transformers import CrossEncoder
+            self.ce = CrossEncoder(name, max_length=MAX_TOKENS, local_files_only=cached)
+
+    def score(self, question, passages, batch=4):
+        if not passages:
+            return np.zeros(0)
+        if not self.qwen:
+            return np.asarray(self.ce.predict([(question, p) for p in passages], batch_size=batch), dtype=float)
+        out = []
+        room = MAX_TOKENS - len(self.prefix) - len(self.suffix)
+        for i in range(0, len(passages), batch):
+            pairs = [f"<Instruct>: {self.INSTRUCT}\n<Query>: {question}\n<Document>: {p}"
+                     for p in passages[i:i + batch]]
+            enc = self.tok(pairs, padding=False, truncation="longest_first",
+                           return_attention_mask=False, max_length=room)
+            enc["input_ids"] = [self.prefix + ids + self.suffix for ids in enc["input_ids"]]
+            enc = self.tok.pad(enc, padding=True, return_tensors="pt")
+            with self.torch.no_grad():
+                logits = self.lm(**enc).logits[:, -1, :]
+            pair = self.torch.stack([logits[:, self.no], logits[:, self.yes]], dim=1)
+            out.extend(self.torch.nn.functional.log_softmax(pair, dim=1)[:, 1].exp().tolist())
+        return np.asarray(out, dtype=float)
+
 
 # ---------------------------------------------------------------- output
 def context_header(question):
@@ -451,15 +564,23 @@ def serve(index, port, host="127.0.0.1"):
             try:
                 if u.path == "/api/sources":
                     return self.send_json({"sources": index.sources(), "pages": len(index.pages),
-                                           "sections": len(index.chunks)})
+                                           "sections": len(index.chunks), "model": index.model_name,
+                                           "reranker": index.reranker_name})
                 if u.path == "/api/search":
                     q = arg("q")
                     if not q:
                         return self.send_json({"error": "empty question"}, 400)
+                    t0 = time.time()
+                    want_rerank = arg("rerank", "1") != "0" and bool(index.reranker_name)
                     res = index.search(q, k=max(1, min(int(arg("k", "5") or 5), 50)),
                                        max_chars=max(1000, int(arg("size", str(MAX_CHARS)) or MAX_CHARS)),
-                                       since=arg("since") or None, groups=qs.get("src") or None)
-                    return self.send_json({"header": context_header(q), "results": [
+                                       since=arg("since") or None, groups=qs.get("src") or None,
+                                       rerank=want_rerank)
+                    return self.send_json({
+                        "header": context_header(q), "seconds": round(time.time() - t0, 2),
+                        "reranked": index.last_reranked, "rerank_available": bool(index.reranker_name),
+                        "warning": index.rerank_error if want_rerank and not index.last_reranked else None,
+                        "results": [
                         {"title": r["title"], "url": r["url"], "date": r.get("date", ""), "kind": r["kind"],
                          "label": r["label"], "whole": r["whole"], "chars": len(r["text"]),
                          "text": r["text"], "block": result_block(n, r)}
@@ -493,9 +614,13 @@ def main():
     a.add_argument("--source", help="only pages whose source/doc name/file contains this text")
     a.add_argument("--out", help="write to a file (e.g. context.md) to attach in Copilot")
     a.add_argument("--clip", action="store_true", help="copy to the Windows clipboard")
+    a.add_argument("--no-rerank", action="store_true", help="skip the reranker (faster, less precise)")
+    a.add_argument("--reranker", default=DEFAULT_RERANKER, help="reranker model (default %(default)s)")
     s = sub.add_parser("serve", help="web page with a copy button")
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--host", default="127.0.0.1", help="listen address (default: this machine only)")
+    s.add_argument("--no-rerank", action="store_true", help="never load the reranker")
+    s.add_argument("--reranker", default=DEFAULT_RERANKER, help="reranker model (default %(default)s)")
     args = ap.parse_args()
 
     if args.cmd == "ingest":
@@ -521,8 +646,11 @@ def main():
         (INDEX_DIR / "meta.json").write_text(json.dumps({"model": args.model}), encoding="utf-8")
         print(f"Index written to {INDEX_DIR.resolve()}")
     elif args.cmd == "ask":
-        idx = Index()
-        res = idx.search(args.question, args.k, args.max_chars, since=args.since, source=args.source)
+        idx = Index(reranker=None if args.no_rerank else args.reranker)
+        res = idx.search(args.question, args.k, args.max_chars, since=args.since, source=args.source,
+                         rerank=not args.no_rerank)
+        if idx.rerank_error:
+            print("warning:", idx.rerank_error, "(results without reranking)", file=sys.stderr)
         ctx = format_context(args.question, res)
         print("Pages: " + " | ".join(r["title"] for r in res), file=sys.stderr)
         if args.out:
@@ -532,7 +660,7 @@ def main():
         if not (args.out or args.clip):
             print(ctx)
     else:
-        serve(Index(), args.port, args.host)
+        serve(Index(reranker=None if args.no_rerank else args.reranker), args.port, args.host)
 
 
 if __name__ == "__main__":
