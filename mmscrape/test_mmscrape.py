@@ -153,6 +153,7 @@ class MMScrapeTest(unittest.TestCase):
         f.add("q1r2", 10, "u1", "Worked, thanks", root="q1", minute=9)
         f.add("sys", 10, "u1", "u1 joined the channel", type="system_join_channel", minute=1)
         f.add("bot", 11, "u3", "Alert", props={"override_username": "Deploy-Bot"})
+        f.add("paste", 11, "u1", "Pasted from a mail client\u2028second line\x85third", minute=30)
 
     @classmethod
     def tearDownClass(cls):
@@ -182,6 +183,7 @@ class MMScrapeTest(unittest.TestCase):
         self.assertLess(q1["text"].index("Wipe the pod"), q1["text"].index("Worked, thanks"))
         self.assertNotIn("q1r1", recs)                                       # replies live inside the thread
         self.assertIn("**Deploy-Bot**", recs["bot"]["text"])
+        self.assertIn("\u2028second line\x85third", recs["paste"]["text"])     # export() reads with splitlines()
         self.assertIn("**user-u3**", recs["s000"]["text"])                   # no full name -> username
 
         # --- incremental: new reply on an old thread, new post, an edit, a deletion

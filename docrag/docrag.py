@@ -133,10 +133,16 @@ def page_sections(page_text):
 def parse_jsonl(text, source):
     """One JSON record per line: {"title", "url", "text", optional "date" (YYYY-MM-DD…), "source"}."""
     pages = []
-    for n, line in enumerate(text.splitlines(), 1):
+    # split on "\n" only: splitlines() also breaks on U+2028/U+2029/U+0085, which JSON keeps
+    # unescaped inside strings (e.g. text pasted from Word/Outlook)
+    for n, line in enumerate(text.split("\n"), 1):
         if not line.strip():
             continue
-        r = json.loads(line)
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError as e:
+            print(f"warning: {source} line {n} skipped, not valid JSON ({e.msg})", file=sys.stderr)
+            continue
         if r.get("text", "").strip():
             pages.append({"title": r.get("title") or f"{source} #{n}", "url": r.get("url", ""),
                           "file": source, "text": r["text"].strip(),

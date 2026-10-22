@@ -342,7 +342,10 @@ def write_export(store, users, server):
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as f:
         for r in build_records(store, users, server):
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            line = json.dumps(r, ensure_ascii=False)
+            for ch in ("\u2028", "\u2029", "\x85"):    # line separators other tools split on
+                line = line.replace(ch, "\\u%04x" % ord(ch))
+            f.write(line + "\n")
     return out
 
 # ---------------------------------------------------------------- commands
