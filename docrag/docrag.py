@@ -30,7 +30,6 @@ INDEX_DIR = Path(os.environ.get("DOCRAG_INDEX", "./docrag_index"))
 DEFAULT_MODEL = "intfloat/multilingual-e5-small"   # FR+EN, runs fine on CPU
 MAX_CHUNK = 1800       # chars per searchable section (the model reads ~512 tokens)
 MIN_CHUNK = 250        # tiny sections get merged with their neighbour
-FULL_PAGE = 8000       # pages up to this size are returned whole (if the budget allows)
 MAX_CHARS = 24000      # default total size budget of one answer (~6k tokens)
 
 # ---------------------------------------------------------------- parsing
@@ -254,26 +253,28 @@ class Index:
                 hits[pid] = []
             hits[pid].append(int(i))
 
-        # Share the size budget: every page gets (remaining budget / remaining pages), so small
-        # pages leave room for the next ones. A page bigger than its share (or than FULL_PAGE)
+        # Share the size budget: pages are filled smallest first, each getting an equal share of
+        # what's left, so unused space flows on to the bigger ones. A page bigger than its share
         # is cut down to its most relevant sections instead of being dropped.
-        results, remaining = [], max_chars
-        for n, (pid, cids) in enumerate(hits.items()):
-            page = self.pages[pid]
-            limit = min(FULL_PAGE, remaining // (len(hits) - n))
+        # Results keep their relevance order.
+        bodies, remaining = {}, max_chars
+        by_size = sorted(hits, key=lambda pid: len(self.pages[pid]["text"]))
+        for n, pid in enumerate(by_size):
+            page, limit = self.pages[pid], remaining // (len(by_size) - n)
             if len(page["text"]) <= limit:
-                body, whole = page["text"], True
+                bodies[pid] = (page["text"], True)
             else:
                 chosen, size = [], 0
-                for c in cids:
+                for c in hits[pid]:
                     t = len(self.chunks[c]["text"]) + 7
                     if chosen and size + t > limit:
                         continue
                     chosen.append(c); size += t
                 whole = len(chosen) == self.page_chunks[pid]
-                body = page["text"] if whole else "\n\n[…]\n\n".join(self.chunks[c]["text"] for c in sorted(chosen))
-            results.append({**page, "text": body, "whole": whole})
-            remaining -= len(body)
+                bodies[pid] = (page["text"] if whole else
+                               "\n\n[…]\n\n".join(self.chunks[c]["text"] for c in sorted(chosen)), whole)
+            remaining -= len(bodies[pid][0])
+        results = [{**self.pages[pid], "text": bodies[pid][0], "whole": bodies[pid][1]} for pid in hits]
         return results
 
 # ---------------------------------------------------------------- embeddings

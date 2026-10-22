@@ -72,9 +72,8 @@ Filters (CLI and web page):
 
 - **The page is the unit of output**, and you always get `-k` pages. They share the size budget
   (`--max-chars`, or the size field on the web page, default 24,000 characters ≈ 6k tokens).
-  A page that fits its share (and is under ~8,000 characters) is sent whole. Otherwise only its
-  most relevant sections are sent, marked "(relevant extracts)". For long chat threads, raise the
-  budget if you want them whole.
+  Small pages get what they need first, and the space left goes to the bigger ones. A page that fits its share is sent whole. Otherwise only its most relevant sections
+  are sent, marked "(relevant extracts)". Raise the budget to get long chat threads whole.
 - **Search runs on sections, not whole pages.** The embedding model only reads ~512 tokens, so
   embedding a whole page would ignore most of it. Each page is cut on its headings for
   matching, and the hits are grouped back by page.
@@ -84,4 +83,4 @@ Filters (CLI and web page):
   This saves a lot of context and keeps navigation menus from polluting results.
   Each page's source URL is kept.
 
-Tunables at the top of the script: `FULL_PAGE`, `MAX_CHUNK`, `MIN_CHUNK`.
+Tunables at the top of the script: `MAX_CHARS` (default budget), `MAX_CHUNK`, `MIN_CHUNK`.
