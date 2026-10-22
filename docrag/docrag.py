@@ -2,14 +2,16 @@
 """
 docrag — local retrieval over your scraped docs, for pasting into Copilot Chat.
 
-  python docrag.py ingest export/*.txt        # build the index (once, or after re-scraping)
+  python docrag.py ingest export/*.txt mm_export/*.jsonl   # (re)build the index; unchanged parts are reused
   python docrag.py ask "which base image for a Java 21 app?" --clip
   python docrag.py ask "..." --out context.md # file to attach in Copilot
+  python docrag.py ask "..." --source "Team Support" --since 2026-01-01   # filter chat threads
   python docrag.py serve                      # small web page at http://localhost:8765
 
-The documentation page is the unit. The export's page blocks
-(=====  DOCUMENT PAGE n / Title: / Source: =====) are parsed, and results
-are whole pages with their title and source URL. Pages too big to send
+The page is the unit of output. Inputs are text exports where the page blocks
+(=====  DOCUMENT PAGE n / Title: / Source: =====) are parsed, or .jsonl files
+with one page per line (title, url, text, optional date and source), such as
+mmscrape's chat threads. Results are whole pages with their title and URL. Pages too big to send
 whole are cut on their headings, and only the matching parts are sent.
 
 Search is hybrid: BM25 for exact terms (image names, properties, error codes)
@@ -128,11 +130,28 @@ def page_sections(page_text):
     return out
 
 
+def parse_jsonl(text, source):
+    """One JSON record per line: {"title", "url", "text", optional "date" (YYYY-MM-DD…), "source"}."""
+    pages = []
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        if r.get("text", "").strip():
+            pages.append({"title": r.get("title") or f"{source} #{n}", "url": r.get("url", ""),
+                          "file": source, "text": r["text"].strip(),
+                          "date": (r.get("date") or "")[:10], "source": r.get("source") or source})
+    return pages
+
+
 def build(files):
     pages, chunks = [], []
     for f in files:
         raw = Path(f).read_text(encoding="utf-8", errors="replace")
-        for p in parse_pages(raw, Path(f).name):
+        parsed = parse_jsonl(raw, Path(f).name) if f.endswith(".jsonl") else parse_pages(raw, Path(f).name)
+        for p in parsed:
+            p.setdefault("date", "")
+            p.setdefault("source", p["file"])
             p["text"] = strip_links(p["text"])
             p["id"] = len(pages)
             pages.append(p)
@@ -198,19 +217,31 @@ class Index:
             self._model = load_model(self.model_name)
         return self._model
 
-    def search(self, question, k=5, max_chars=24000):
-        """Return up to k pages: whole when small enough, else only their matching sections."""
-        n = len(self.chunks)
-        bm = self.bm25.scores(tokenize(question))
+    def search(self, question, k=5, max_chars=24000, since=None, source=None):
+        """Return up to k pages: whole when small enough, else only their matching sections.
+        since: keep only pages dated on/after YYYY-MM-DD (undated pages are dropped).
+        source: keep only pages whose source or file name contains this text."""
+        allowed = np.ones(len(self.chunks), dtype=bool)
+        if since or source:
+            for i, c in enumerate(self.chunks):
+                p = self.pages[c["page"]]
+                if since and not (p.get("date") and p["date"] >= since):
+                    allowed[i] = False
+                elif source and source.lower() not in f"{p.get('source', '')} {p['file']}".lower():
+                    allowed[i] = False
+        idx = np.flatnonzero(allowed)
+        if not len(idx):
+            return []
+        bm = self.bm25.scores(tokenize(question))[idx]
         qv = embed(self.model, self.model_name, [question], is_query=True)[0]
-        vec = self.emb @ qv
-        rrf = np.zeros(n)                      # reciprocal rank fusion of both rankings
+        vec = self.emb[idx] @ qv
+        rrf = np.zeros(len(idx))               # reciprocal rank fusion of both rankings
         for scores in (bm, vec):
             order = np.argsort(-scores)
-            rrf[order] += 1.0 / (60 + np.arange(1, n + 1))
+            rrf[order] += 1.0 / (60 + np.arange(1, len(idx) + 1))
 
         hits = {}                              # page id -> matching chunk ids, best page first
-        for i in np.argsort(-rrf)[: k * 6]:
+        for i in idx[np.argsort(-rrf)[: k * 6]]:
             pid = self.chunks[i]["page"]
             if pid in hits or len(hits) < k:
                 hits.setdefault(pid, []).append(int(i))
@@ -229,6 +260,24 @@ class Index:
         return results
 
 # ---------------------------------------------------------------- embeddings
+def text_hash(t):
+    import hashlib
+    return hashlib.sha1(t.encode("utf-8")).hexdigest()
+
+
+def reuse_embeddings(texts, model_name, path=INDEX_DIR):
+    """Vectors from the previous index for identical text (same model); None where a new one is needed."""
+    try:
+        if json.loads((path / "meta.json").read_text(encoding="utf-8"))["model"] != model_name:
+            return [None] * len(texts)
+        old_chunks = json.loads((path / "chunks.json").read_text(encoding="utf-8"))
+        old_emb = np.load(path / "embeddings.npy")
+        cache = {c["hash"]: old_emb[i] for i, c in enumerate(old_chunks) if "hash" in c}
+    except (OSError, KeyError, ValueError):
+        return [None] * len(texts)
+    return [cache.get(text_hash(t)) for t in texts]
+
+
 def load_model(name):
     from sentence_transformers import SentenceTransformer
     return SentenceTransformer(name)
@@ -242,11 +291,12 @@ def embed(model, name, texts, is_query=False):
 
 # ---------------------------------------------------------------- output
 def format_context(question, results):
-    parts = ["Use only the documentation pages below to answer. Cite the page title and URL you rely on.\n"
+    parts = ["Use only the pages below (documentation and/or chat threads) to answer. Cite the page title and URL you rely on.\n"
              f"If the pages don't contain the answer, say so.\n\nQuestion: {question}\n"]
     for n, r in enumerate(results, 1):
         note = "" if r["whole"] else " (relevant extracts)"
-        parts.append(f"---\n## Page {n}: {r['title']}{note}\nSource: {r['url'] or r['file']}\n\n{r['text']}\n")
+        date = f"\nDate: {r['date']}" if r.get("date") else ""
+        parts.append(f"---\n## Page {n}: {r['title']}{note}\nSource: {r['url'] or r['file']}{date}\n\n{r['text']}\n")
     return "\n".join(parts)
 
 
@@ -269,7 +319,10 @@ PAGE = """<!doctype html><meta charset=utf-8><title>docrag</title>
 input{width:75%;font-size:16px;padding:6px}button{font-size:16px;padding:6px 12px}
 textarea{width:100%;height:65vh;font:13px ui-monospace,monospace;margin-top:1em}</style>
 <form><input name=q value="{q}" autofocus placeholder="Ask about the docs…">
-<input name=k type=number value="{k}" style="width:4em" title="pages"> <button>Search</button></form>
+<input name=k type=number value="{k}" style="width:4em" title="pages"><br>
+<input name=since value="{since}" placeholder="since YYYY-MM-DD" style="width:11em">
+<input name=source value="{source}" placeholder="source filter (e.g. channel)" style="width:16em">
+<button>Search</button></form>
 <textarea id=out>{ctx}</textarea>
 <button onclick="navigator.clipboard.writeText(document.getElementById('out').value);this.textContent='Copied ✓'">Copy for Copilot</button>
 <span style="color:#888;margin-left:1em">{info}</span>"""
@@ -280,12 +333,14 @@ def serve(index, port):
         def do_GET(self):
             qs = parse_qs(urlparse(self.path).query)
             q, k = qs.get("q", [""])[0], int(qs.get("k", ["5"])[0] or 5)
+            since, source = qs.get("since", [""])[0].strip(), qs.get("source", [""])[0].strip()
             ctx, info = "", f"{len(index.pages)} pages, {len(index.chunks)} sections indexed"
             if q:
-                res = index.search(q, k=k)
+                res = index.search(q, k=k, since=since or None, source=source or None)
                 ctx = format_context(q, res)
                 info = f"{len(res)} pages · {len(ctx):,} chars · " + " | ".join(r["title"] for r in res)
             body = PAGE.replace("{q}", html.escape(q)).replace("{k}", str(k)) \
+                       .replace("{since}", html.escape(since)).replace("{source}", html.escape(source)) \
                        .replace("{ctx}", html.escape(ctx)).replace("{info}", html.escape(info))
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers(); self.wfile.write(body.encode())
@@ -306,6 +361,8 @@ def main():
     a.add_argument("question")
     a.add_argument("-k", type=int, default=5, help="number of pages (default 5)")
     a.add_argument("--max-chars", type=int, default=24000, help="total size budget")
+    a.add_argument("--since", help="only pages dated on/after YYYY-MM-DD (e.g. chat threads)")
+    a.add_argument("--source", help="only pages whose source/file contains this text")
     a.add_argument("--out", help="write to a file (e.g. context.md) to attach in Copilot")
     a.add_argument("--clip", action="store_true", help="copy to the Windows clipboard")
     s = sub.add_parser("serve", help="web page with a copy button")
@@ -316,9 +373,18 @@ def main():
         pages, chunks = build(args.files)
         print(f"{len(pages)} pages, {len(chunks)} sections from {len(args.files)} file(s); "
               f"embedding with {args.model} …")
-        model = load_model(args.model)
         titles = {p["id"]: p["title"] for p in pages}
-        emb = embed(model, args.model, [f"{titles[c['page']]} > {c['path']}\n{c['text']}" for c in chunks])
+        texts = [f"{titles[c['page']]} > {c['path']}\n{c['text']}" for c in chunks]
+        emb = reuse_embeddings(texts, args.model)          # unchanged sections keep their vectors
+        todo = [i for i, v in enumerate(emb) if v is None]
+        print(f"{len(chunks) - len(todo)} sections unchanged, {len(todo)} to embed")
+        if todo:
+            new = embed(load_model(args.model), args.model, [texts[i] for i in todo])
+            for i, v in zip(todo, new):
+                emb[i] = v
+        emb = np.vstack(emb).astype(np.float32) if emb else np.zeros((0, 1), dtype=np.float32)
+        for c, t in zip(chunks, texts):
+            c["hash"] = text_hash(t)
         INDEX_DIR.mkdir(parents=True, exist_ok=True)
         np.save(INDEX_DIR / "embeddings.npy", emb)
         (INDEX_DIR / "pages.json").write_text(json.dumps(pages, ensure_ascii=False), encoding="utf-8")
@@ -327,7 +393,7 @@ def main():
         print(f"Index written to {INDEX_DIR.resolve()}")
     elif args.cmd == "ask":
         idx = Index()
-        res = idx.search(args.question, args.k, args.max_chars)
+        res = idx.search(args.question, args.k, args.max_chars, since=args.since, source=args.source)
         ctx = format_context(args.question, res)
         print("Pages: " + " | ".join(r["title"] for r in res), file=sys.stderr)
         if args.out:

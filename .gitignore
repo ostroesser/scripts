@@ -3,3 +3,5 @@ __pycache__/
 .venv/
 docrag_index/
 context.md
+mm_data/
+mm_export/

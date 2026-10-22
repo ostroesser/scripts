@@ -30,7 +30,20 @@ Source: https://…/getting-started/index.html
 …
 ```
 
-A file without page blocks is treated as a single page. Re-run `ingest` whenever you re-scrape.
+A file without page blocks is treated as a single page.
+
+`.jsonl` files are also accepted, with one page per line:
+`{"title", "url", "text", "date" (optional, YYYY-MM-DD), "source" (optional)}`.
+That's what [mmscrape](../mmscrape/) produces for Mattermost threads. Docs and chat can go in
+the same index:
+
+```bash
+python docrag.py ingest export/*.txt ../mmscrape/mm_export/*.jsonl
+```
+
+Re-run `ingest` whenever you re-scrape. Sections whose text didn't change keep their vectors,
+so only new content is embedded.
+
 The index goes to `./docrag_index` (change it with `DOCRAG_INDEX=/some/dir`).
 
 The first run downloads the embedding model (~470 MB, `intfloat/multilingual-e5-small`, FR+EN).
@@ -43,11 +56,16 @@ from Hugging Face and pass its local path: `--model /path/to/multilingual-e5-sma
 python docrag.py ask "which base image for a Spring Boot app?" --clip     # → Windows clipboard
 python docrag.py ask "how do hardened images differ?" --out context.md    # → file to attach in Copilot
 python docrag.py ask "..." -k 8 --max-chars 40000                         # more / bigger context
+python docrag.py ask "..." --source "Team Support" --since 2026-01-01   # only that channel, recent threads
 python docrag.py serve     # browser page at http://localhost:8765 with a "Copy for Copilot" button
 ```
 
 The output is a short instruction ("answer only from these pages, cite title and URL"),
 then the question, then the pages. Paste it as-is.
+
+Filters (CLI and web page):
+- `--source TEXT`: keep pages whose source or file name contains TEXT (a channel name, a doc export file).
+- `--since YYYY-MM-DD`: keep pages dated on or after that day. Only dated pages (chat threads) pass.
 
 ## How it works
 
