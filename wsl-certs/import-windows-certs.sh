@@ -30,17 +30,36 @@ mkdir -p "$DEST"
 
 echo "Exporting the Windows certificate stores …"
 # Root and intermediate CAs, machine and user stores, as PEM on stdout.
-powershell.exe -NoProfile -NonInteractive -Command - <<'PS' | tr -d '\r' > "$DEST/windows-ca.pem"
-$stores = 'Cert:\LocalMachine\Root','Cert:\CurrentUser\Root','Cert:\LocalMachine\CA','Cert:\CurrentUser\CA'
-foreach ($c in (Get-ChildItem $stores -ErrorAction SilentlyContinue | Sort-Object Thumbprint -Unique)) {
-  '-----BEGIN CERTIFICATE-----'
-  [Convert]::ToBase64String($c.RawData, 'InsertLineBreaks')
-  '-----END CERTIFICATE-----'
-}
-PS
+# Kept on one line: multi-line PowerShell fed through stdin never runs.
+PS_EXPORT='$s = "Cert:\LocalMachine\Root","Cert:\CurrentUser\Root","Cert:\LocalMachine\CA","Cert:\CurrentUser\CA"; Get-ChildItem $s -ErrorAction SilentlyContinue | Sort-Object Thumbprint -Unique | ForEach-Object { "-----BEGIN CERTIFICATE-----"; [Convert]::ToBase64String($_.RawData, "InsertLineBreaks"); "-----END CERTIFICATE-----" }'
+powershell.exe -NoProfile -NonInteractive -Command "$PS_EXPORT" 2>"$DEST/powershell-errors.txt" \
+  | tr -d '\r' > "$DEST/windows-ca.pem" || true
 
 n=$(grep -c "BEGIN CERTIFICATE" "$DEST/windows-ca.pem" || true)
-[[ "$n" -gt 0 ]] || { echo "No certificates exported. Is PowerShell blocked?" >&2; exit 1; }
+
+if [[ "$n" -eq 0 ]]; then
+  # Fallback for locked-down PowerShell (ConstrainedLanguage blocks [Convert]):
+  # export each certificate as a DER file with a standard cmdlet, convert to PEM here.
+  echo "  direct export failed, trying Export-Certificate …"
+  PS_FILES='$s = "Cert:\LocalMachine\Root","Cert:\CurrentUser\Root","Cert:\LocalMachine\CA","Cert:\CurrentUser\CA"; $d = Join-Path $env:TEMP "wsl-certs"; New-Item -ItemType Directory -Force -Path $d | Out-Null; Get-ChildItem $s -ErrorAction SilentlyContinue | Sort-Object Thumbprint -Unique | ForEach-Object { Export-Certificate -Cert $_ -FilePath (Join-Path $d ($_.Thumbprint + ".cer")) -Type CERT | Out-Null }; $d'
+  WIN_DIR=$(powershell.exe -NoProfile -NonInteractive -Command "$PS_FILES" 2>>"$DEST/powershell-errors.txt" | tr -d '\r' | tail -1 || true)
+  if [[ -n "$WIN_DIR" ]] && LIN_DIR=$(wslpath -u "$WIN_DIR" 2>/dev/null) && [[ -d "$LIN_DIR" ]]; then
+    python3 -c "import ssl,sys,glob
+for f in sorted(glob.glob(sys.argv[1] + '/*.cer')):
+    sys.stdout.write(ssl.DER_cert_to_PEM_cert(open(f, 'rb').read()))" "$LIN_DIR" > "$DEST/windows-ca.pem"
+    rm -rf "$LIN_DIR"
+    n=$(grep -c "BEGIN CERTIFICATE" "$DEST/windows-ca.pem" || true)
+  fi
+fi
+
+if [[ "$n" -eq 0 ]]; then
+  echo "No certificates exported. PowerShell said:" >&2
+  tr -d '\r' < "$DEST/powershell-errors.txt" | head -20 >&2
+  echo >&2
+  echo "PowerShell language mode (should be FullLanguage):" >&2
+  powershell.exe -NoProfile -NonInteractive -Command '$ExecutionContext.SessionState.LanguageMode' 2>&1 | tr -d '\r' >&2 || true
+  exit 1
+fi
 echo "  $n certificates from Windows"
 
 # Public CAs from Linux + Windows/corporate CAs
