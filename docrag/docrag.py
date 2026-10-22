@@ -60,6 +60,12 @@ def parse_pages(text, source):
         title = m.group(2)
         if body:
             pages.append({"title": title, "url": m.group(3), "file": source, "text": body})
+    # Doc sites append their name to every title ("Page - Site"): drop a suffix shared by all pages.
+    if len(pages) >= 2:
+        sfx = re.search(r"\s+[-|\u2013\u2014]\s+[^-|\u2013\u2014]+$", pages[0]["title"])
+        if sfx and all(p["title"].endswith(sfx.group(0)) and p["title"] != sfx.group(0).strip() for p in pages):
+            for p in pages:
+                p["title"] = p["title"][: -len(sfx.group(0))]
     return pages
 
 
@@ -146,8 +152,32 @@ def parse_jsonl(text, source):
         if r.get("text", "").strip():
             pages.append({"title": r.get("title") or f"{source} #{n}", "url": r.get("url", ""),
                           "file": source, "text": r["text"].strip(),
-                          "date": (r.get("date") or "")[:10], "source": r.get("source") or source})
+                          "date": (r.get("date") or "")[:10], "source": r.get("source") or source,
+                          "channel": r.get("channel") or ""})
     return pages
+
+
+def readable(file_name):
+    """'BaseContainerImages.txt' -> 'Base Container Images', 'my_product-docs.txt' -> 'my product docs'."""
+    stem = Path(file_name).stem
+    stem = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", stem)
+    return re.sub(r"[_\-]+", " ", stem).strip() or file_name
+
+
+def page_meta(p):
+    """Fill in what the source filter needs: kind (docs/chat), group and its display label.
+    Docs are grouped by export file, chat threads by channel."""
+    if p.get("kind"):
+        return p
+    if p["file"].endswith(".jsonl"):
+        p["kind"] = "chat"
+        p["group"] = p.get("channel") or p.get("source") or Path(p["file"]).stem
+        p["label"] = p.get("source") or p["group"]
+    else:
+        p["kind"] = "docs"
+        p["group"] = Path(p["file"]).stem
+        p["label"] = readable(p["file"])
+    return p
 
 
 def build(files):
@@ -158,6 +188,7 @@ def build(files):
         for p in parsed:
             p.setdefault("date", "")
             p.setdefault("source", p["file"])
+            page_meta(p)
             p["text"] = strip_links(p["text"])
             p["id"] = len(pages)
             pages.append(p)
@@ -207,7 +238,7 @@ class BM25:
 class Index:
     def __init__(self, path=INDEX_DIR):
         meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
-        self.pages = json.loads((path / "pages.json").read_text(encoding="utf-8"))
+        self.pages = [page_meta(p) for p in json.loads((path / "pages.json").read_text(encoding="utf-8"))]
         self.chunks = json.loads((path / "chunks.json").read_text(encoding="utf-8"))
         self.emb = np.load(path / "embeddings.npy")
         self.model_name = meta["model"]
@@ -216,6 +247,16 @@ class Index:
             self.page_chunks[c["page"]] = self.page_chunks.get(c["page"], 0) + 1
         self.bm25 = BM25([tokenize(self.chunk_header(c) + " " + c["text"]) for c in self.chunks])
         self._model = None
+
+    def sources(self):
+        """Filterable sources: one entry per docs export file and per chat channel."""
+        out = {}
+        for p in self.pages:
+            key = f"{p['kind']}:{p['group']}"
+            if key not in out:
+                out[key] = {"key": key, "kind": p["kind"], "group": p["group"], "label": p["label"], "count": 0}
+            out[key]["count"] += 1
+        return sorted(out.values(), key=lambda x: (x["kind"] != "docs", x["label"].lower()))
 
     def chunk_header(self, c):
         return f"{self.pages[c['page']]['title']} {c['path']}"
@@ -226,19 +267,25 @@ class Index:
             self._model = load_model(self.model_name)
         return self._model
 
-    def search(self, question, k=5, max_chars=None, since=None, source=None):
+    def search(self, question, k=5, max_chars=None, since=None, source=None, groups=None):
         """Return up to k pages: whole when small enough, else only their matching sections.
-        since: keep only pages dated on/after YYYY-MM-DD (undated pages are dropped).
-        source: keep only pages whose source or file name contains this text."""
+        since:  chat threads only: keep those active on/after YYYY-MM-DD (docs are not affected).
+        source: keep pages whose source, label or file name contains this text.
+        groups: keep pages of these sources ("docs:<file>", "chat:<team/channel>", or
+                "docs:*" / "chat:*" for all of a kind); several are combined with OR."""
         max_chars = max_chars or MAX_CHARS
-        allowed = np.ones(len(self.chunks), dtype=bool)
-        if since or source:
-            for i, c in enumerate(self.chunks):
-                p = self.pages[c["page"]]
-                if since and not (p.get("date") and p["date"] >= since):
-                    allowed[i] = False
-                elif source and source.lower() not in f"{p.get('source', '')} {p['file']}".lower():
-                    allowed[i] = False
+        groups = set(groups or ())
+        page_ok = []
+        for p in self.pages:
+            ok = True
+            if since and p["kind"] == "chat" and not (p.get("date") and p["date"] >= since):
+                ok = False
+            elif source and source.lower() not in f"{p.get('source', '')} {p['label']} {p['file']}".lower():
+                ok = False
+            elif groups and f"{p['kind']}:{p['group']}" not in groups and f"{p['kind']}:*" not in groups:
+                ok = False
+            page_ok.append(ok)
+        allowed = np.array([page_ok[c["page"]] for c in self.chunks], dtype=bool)
         idx = np.flatnonzero(allowed)
         if not len(idx):
             return []
@@ -336,17 +383,22 @@ def embed(model, name, texts, is_query=False):
     return np.asarray(v, dtype=np.float32)
 
 # ---------------------------------------------------------------- output
-def format_context(question, results):
+def context_header(question):
     # The question comes first, on its own line: Copilot uses the start of the message
     # as the conversation title in its sidebar.
-    parts = [f"{question.strip()}\n\n"
-             "Use only the pages below (documentation and/or chat threads) to answer the question above. "
-             "Cite the page title and URL you rely on.\nIf the pages don't contain the answer, say so.\n"]
-    for n, r in enumerate(results, 1):
-        note = "" if r["whole"] else " (relevant extracts)"
-        date = f"\nDate: {r['date']}" if r.get("date") else ""
-        parts.append(f"---\n## Page {n}: {r['title']}{note}\nSource: {r['url'] or r['file']}{date}\n\n{r['text']}\n")
-    return "\n".join(parts)
+    return (f"{question.strip()}\n\n"
+            "Use only the pages below (documentation and/or chat threads) to answer the question above. "
+            "Cite the page title and URL you rely on.\nIf the pages don't contain the answer, say so.\n")
+
+
+def result_block(n, r):
+    note = "" if r["whole"] else " (relevant extracts)"
+    date = f"\nDate: {r['date']}" if r.get("date") else ""
+    return f"---\n## Page {n}: {r['title']}{note}\nSource: {r['url'] or r['file']}{date}\n\n{r['text']}\n"
+
+
+def format_context(question, results):
+    return "\n".join([context_header(question)] + [result_block(n, r) for n, r in enumerate(results, 1)])
 
 
 def to_clipboard(text):
@@ -363,43 +415,60 @@ def to_clipboard(text):
         subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode(), check=True)
 
 # ---------------------------------------------------------------- web page
-PAGE = """<!doctype html><meta charset=utf-8><title>docrag</title>
-<style>body{font:15px system-ui;max-width:900px;margin:2em auto;padding:0 1em}
-input{width:75%;font-size:16px;padding:6px}button{font-size:16px;padding:6px 12px}
-textarea{width:100%;height:65vh;font:13px ui-monospace,monospace;margin-top:1em}</style>
-<form><input name=q value="{q}" autofocus placeholder="Ask about the docs…">
-<input name=k type=number value="{k}" style="width:4em" title="number of pages"><br>
-<input name=size type=number value="{size}" step=1000 style="width:7em" title="total size budget (characters)">
-<input name=since value="{since}" placeholder="since YYYY-MM-DD" style="width:11em">
-<input name=source value="{source}" placeholder="source filter (e.g. channel)" style="width:16em">
-<button>Search</button></form>
-<textarea id=out>{ctx}</textarea>
-<button onclick="navigator.clipboard.writeText(document.getElementById('out').value);this.textContent='Copied ✓'">Copy for Copilot</button>
-<span style="color:#888;margin-left:1em">{info}</span>"""
+UI_DIR = Path(__file__).resolve().parent / "ui"
+STATIC = {"/": ("index.html", "text/html"), "/app.css": ("app.css", "text/css"),
+          "/app.js": ("app.js", "application/javascript")}
 
 
-def serve(index, port):
+def serve(index, port, host="127.0.0.1"):
+    """Web UI + JSON API:
+      GET /api/sources                  -> {"sources": [...], "pages": n, "sections": n}
+      GET /api/search?q=&k=&size=&since=&src=<key>&src=<key>
+                                        -> {"header": str, "results": [{..., "block": str}]}"""
     class H(BaseHTTPRequestHandler):
+        def send(self, code, body, ctype):
+            data = body if isinstance(body, bytes) else body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", f"{ctype}; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def send_json(self, obj, code=200):
+            self.send(code, json.dumps(obj, ensure_ascii=False), "application/json")
+
         def do_GET(self):
-            qs = parse_qs(urlparse(self.path).query)
-            q, k = qs.get("q", [""])[0], int(qs.get("k", ["5"])[0] or 5)
-            since, source = qs.get("since", [""])[0].strip(), qs.get("source", [""])[0].strip()
-            size = int(qs.get("size", [str(MAX_CHARS)])[0] or MAX_CHARS)
-            ctx, info = "", f"{len(index.pages)} pages, {len(index.chunks)} sections indexed"
-            if q:
-                res = index.search(q, k=k, max_chars=size, since=since or None, source=source or None)
-                ctx = format_context(q, res)
-                info = f"{len(res)} pages · {len(ctx):,} chars · " + " | ".join(r["title"] for r in res)
-            body = PAGE.replace("{q}", html.escape(q)).replace("{k}", str(k)) \
-                       .replace("{size}", str(size)).replace("{since}", html.escape(since)).replace("{source}", html.escape(source)) \
-                       .replace("{ctx}", html.escape(ctx)).replace("{info}", html.escape(info))
-            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers(); self.wfile.write(body.encode())
+            u = urlparse(self.path)
+            qs = parse_qs(u.query)
+            arg = lambda name, default="": (qs.get(name) or [default])[0].strip()
+            try:
+                if u.path == "/api/sources":
+                    return self.send_json({"sources": index.sources(), "pages": len(index.pages),
+                                           "sections": len(index.chunks)})
+                if u.path == "/api/search":
+                    q = arg("q")
+                    if not q:
+                        return self.send_json({"error": "empty question"}, 400)
+                    res = index.search(q, k=max(1, min(int(arg("k", "5") or 5), 50)),
+                                       max_chars=max(1000, int(arg("size", str(MAX_CHARS)) or MAX_CHARS)),
+                                       since=arg("since") or None, groups=qs.get("src") or None)
+                    return self.send_json({"header": context_header(q), "results": [
+                        {"title": r["title"], "url": r["url"], "date": r.get("date", ""), "kind": r["kind"],
+                         "label": r["label"], "whole": r["whole"], "chars": len(r["text"]),
+                         "text": r["text"], "block": result_block(n, r)}
+                        for n, r in enumerate(res, 1)]})
+                if u.path in STATIC:
+                    name, ctype = STATIC[u.path]
+                    return self.send(200, (UI_DIR / name).read_bytes(), ctype)
+                self.send(404, "not found", "text/plain")
+            except Exception as e:                 # show the error in the page instead of a dead request
+                self.send_json({"error": f"{type(e).__name__}: {e}"}, 500)
 
         def log_message(self, *a):
             pass
-    print(f"docrag on http://localhost:{port}  (Ctrl+C to stop)")
-    HTTPServer(("0.0.0.0", port), H).serve_forever()
+    print(f"docrag on http://localhost:{port}  ({len(index.pages)} pages)  Ctrl+C to stop")
+    HTTPServer((host, port), H).serve_forever()
 
 # ---------------------------------------------------------------- CLI
 def main():
@@ -412,12 +481,13 @@ def main():
     a.add_argument("question")
     a.add_argument("-k", type=int, default=5, help="number of pages (default 5)")
     a.add_argument("--max-chars", type=int, default=MAX_CHARS, help="total size budget (characters)")
-    a.add_argument("--since", help="only pages dated on/after YYYY-MM-DD (e.g. chat threads)")
-    a.add_argument("--source", help="only pages whose source/file contains this text")
+    a.add_argument("--since", help="chat threads active on/after YYYY-MM-DD (docs are not affected)")
+    a.add_argument("--source", help="only pages whose source/doc name/file contains this text")
     a.add_argument("--out", help="write to a file (e.g. context.md) to attach in Copilot")
     a.add_argument("--clip", action="store_true", help="copy to the Windows clipboard")
     s = sub.add_parser("serve", help="web page with a copy button")
     s.add_argument("--port", type=int, default=8765)
+    s.add_argument("--host", default="127.0.0.1", help="listen address (default: this machine only)")
     args = ap.parse_args()
 
     if args.cmd == "ingest":
@@ -454,7 +524,7 @@ def main():
         if not (args.out or args.clip):
             print(ctx)
     else:
-        serve(Index(), args.port)
+        serve(Index(), args.port, args.host)
 
 
 if __name__ == "__main__":

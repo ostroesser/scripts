@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>docrag</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <span class="wordmark">docrag</span>
+  <span class="stats" id="stats">Loading the index…</span>
+</header>
+
+<main>
+  <form id="ask" class="ask" autocomplete="off">
+    <label for="q" class="visually-hidden">Question</label>
+    <textarea id="q" rows="1" placeholder="Ask about the docs or the channels…" required></textarea>
+    <button type="submit" id="go" class="btn btn-ink">Search</button>
+  </form>
+
+  <section class="filters" aria-label="Filters">
+    <div class="field field-sources">
+      <span class="field-label" id="src-label">Sources</span>
+      <div class="combo" id="combo">
+        <div class="combo-box" id="combo-box">
+          <div class="chips" id="chips"></div>
+          <input id="combo-input" type="text" role="combobox" aria-labelledby="src-label"
+                 aria-expanded="false" aria-controls="combo-list" aria-autocomplete="list"
+                 placeholder="All sources">
+          <button type="button" class="combo-toggle" id="combo-toggle" tabindex="-1" aria-label="Show sources">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 6l4 4 4-4" /></svg>
+          </button>
+        </div>
+        <ul class="combo-list" id="combo-list" role="listbox" aria-multiselectable="true" hidden></ul>
+      </div>
+    </div>
+
+    <div class="field">
+      <label class="field-label" for="since">Chat since</label>
+      <input type="date" id="since" class="input">
+    </div>
+
+    <div class="field">
+      <span class="field-label" id="k-label">Pages</span>
+      <div class="stepper" role="group" aria-labelledby="k-label">
+        <button type="button" class="step" data-step="-1" aria-label="Fewer pages">−</button>
+        <input id="k" type="number" min="1" max="50" value="5" aria-labelledby="k-label">
+        <button type="button" class="step" data-step="1" aria-label="More pages">+</button>
+      </div>
+    </div>
+
+    <div class="field field-size">
+      <label class="field-label" for="size">Size</label>
+      <input type="range" id="size" min="4000" max="200000" step="1000" value="24000">
+      <output id="size-out" for="size"></output>
+    </div>
+  </section>
+
+  <section class="packet" id="packet" hidden>
+    <div class="meter" id="meter" aria-hidden="true"></div>
+    <div class="packet-bar">
+      <p class="packet-text" id="packet-text"></p>
+      <button type="button" class="btn btn-ink" id="copy">Copy for Copilot</button>
+    </div>
+  </section>
+
+  <p class="notice" id="notice" role="status" hidden></p>
+  <ol class="results" id="results"></ol>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

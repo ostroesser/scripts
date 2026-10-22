@@ -60,16 +60,38 @@ python docrag.py ask "which base image for a Spring Boot app?" --clip     # → 
 python docrag.py ask "how do hardened images differ?" --out context.md    # → file to attach in Copilot
 python docrag.py ask "..." -k 8 --max-chars 40000                         # more pages / bigger budget
 python docrag.py ask "..." --source "Team Support" --since 2026-01-01   # only that channel, recent threads
-python docrag.py serve     # browser page at http://localhost:8765 with a "Copy for Copilot" button
+python docrag.py serve     # web page at http://localhost:8765 (see below)
 ```
 
 The output starts with your question (so Copilot uses it as the conversation title), then a
 short instruction ("answer only from these pages, cite title and URL"), then the pages.
 Paste it as-is.
 
-Filters (CLI and web page):
-- `--source TEXT`: keep pages whose source or file name contains TEXT (a channel name, a doc export file).
-- `--since YYYY-MM-DD`: keep pages dated on or after that day. Only dated pages (chat threads) pass.
+Filters on the command line:
+- `--source TEXT`: keep pages whose channel, doc name or file name contains TEXT.
+- `--since YYYY-MM-DD`: keep chat threads active on or after that day. Docs are not affected.
+
+## The web page
+
+`python docrag.py serve`, then open http://localhost:8765. It only listens on this machine
+(`--host 0.0.0.0` to change that).
+
+- **Sources**: type to find a doc (named after its export file) or a Mattermost channel (by
+  name or `team/channel`; accents and case don't matter), Enter or click to add it. Pick
+  several to combine them, or "All documentation" / "All Mattermost channels". Backspace
+  removes the last one.
+- **Chat since**: only chat threads with activity on or after that date. Docs always pass.
+- **Pages** and **Size**: how many pages, and the total size budget they share.
+- **Results**: untick a result to leave it out of the copy. The bar above shows how full the
+  copy is, one segment per page (blue for docs, ochre for chat). "Preview" shows exactly
+  the text that will be copied.
+- **Copy for Copilot** (or Ctrl+Enter) copies the question, the instruction and the ticked pages.
+- Filters are remembered, and the address bar holds the whole search, so you can bookmark one.
+  Light and dark follow your Windows theme.
+
+The page talks to two endpoints you can also script against: `GET /api/sources` and
+`GET /api/search?q=…&k=5&size=24000&since=YYYY-MM-DD&src=docs:<file>&src=chat:<team/channel>`
+(`src=docs:*` / `src=chat:*` for all of a kind).
 
 ## How it works
 
@@ -82,6 +104,8 @@ Filters (CLI and web page):
   matching, and the hits are grouped back by page.
 - **Hybrid search.** Exact terms (image names like `rhel9-base`, property keys, error codes) are
   matched by keywords, and paraphrased questions by meaning.
+- **Doc titles lose the site name** that doc sites append to every page ("Page - Site"),
+  when every page of an export has the same suffix.
 - **Markdown links are reduced to their label** (`[Java Images](https://…)` → `Java Images`).
   This saves a lot of context and keeps navigation menus from polluting results.
   Each page's source URL is kept.
