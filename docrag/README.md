@@ -56,7 +56,7 @@ from Hugging Face and pass its local path: `--model /path/to/multilingual-e5-sma
 ```bash
 python docrag.py ask "which base image for a Spring Boot app?" --clip     # → Windows clipboard
 python docrag.py ask "how do hardened images differ?" --out context.md    # → file to attach in Copilot
-python docrag.py ask "..." -k 8 --max-chars 40000                         # more / bigger context
+python docrag.py ask "..." -k 8 --max-chars 40000                         # more pages / bigger budget
 python docrag.py ask "..." --source "Team Support" --since 2026-01-01   # only that channel, recent threads
 python docrag.py serve     # browser page at http://localhost:8765 with a "Copy for Copilot" button
 ```
@@ -70,8 +70,11 @@ Filters (CLI and web page):
 
 ## How it works
 
-- **The page is the unit of output.** Pages up to ~8,000 characters are sent whole. Longer
-  pages are sent as their 3 best-matching sections, marked "(relevant extracts)".
+- **The page is the unit of output**, and you always get `-k` pages. They share the size budget
+  (`--max-chars`, or the size field on the web page, default 24,000 characters ≈ 6k tokens).
+  A page that fits its share (and is under ~8,000 characters) is sent whole. Otherwise only its
+  most relevant sections are sent, marked "(relevant extracts)". For long chat threads, raise the
+  budget if you want them whole.
 - **Search runs on sections, not whole pages.** The embedding model only reads ~512 tokens, so
   embedding a whole page would ignore most of it. Each page is cut on its headings for
   matching, and the hits are grouped back by page.

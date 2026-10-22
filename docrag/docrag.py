@@ -30,7 +30,8 @@ INDEX_DIR = Path(os.environ.get("DOCRAG_INDEX", "./docrag_index"))
 DEFAULT_MODEL = "intfloat/multilingual-e5-small"   # FR+EN, runs fine on CPU
 MAX_CHUNK = 1800       # chars per searchable section (the model reads ~512 tokens)
 MIN_CHUNK = 250        # tiny sections get merged with their neighbour
-FULL_PAGE = 8000       # pages up to this size are returned whole
+FULL_PAGE = 8000       # pages up to this size are returned whole (if the budget allows)
+MAX_CHARS = 24000      # default total size budget of one answer (~6k tokens)
 
 # ---------------------------------------------------------------- parsing
 PAGE_BLOCK = re.compile(
@@ -205,6 +206,9 @@ class Index:
         self.chunks = json.loads((path / "chunks.json").read_text(encoding="utf-8"))
         self.emb = np.load(path / "embeddings.npy")
         self.model_name = meta["model"]
+        self.page_chunks = {}
+        for c in self.chunks:
+            self.page_chunks[c["page"]] = self.page_chunks.get(c["page"], 0) + 1
         self.bm25 = BM25([tokenize(self.chunk_header(c) + " " + c["text"]) for c in self.chunks])
         self._model = None
 
@@ -217,10 +221,11 @@ class Index:
             self._model = load_model(self.model_name)
         return self._model
 
-    def search(self, question, k=5, max_chars=24000, since=None, source=None):
+    def search(self, question, k=5, max_chars=None, since=None, source=None):
         """Return up to k pages: whole when small enough, else only their matching sections.
         since: keep only pages dated on/after YYYY-MM-DD (undated pages are dropped).
         source: keep only pages whose source or file name contains this text."""
+        max_chars = max_chars or MAX_CHARS
         allowed = np.ones(len(self.chunks), dtype=bool)
         if since or source:
             for i, c in enumerate(self.chunks):
@@ -240,23 +245,35 @@ class Index:
             order = np.argsort(-scores)
             rrf[order] += 1.0 / (60 + np.arange(1, len(idx) + 1))
 
-        hits = {}                              # page id -> matching chunk ids, best page first
-        for i in idx[np.argsort(-rrf)[: k * 6]]:
+        hits = {}                              # k best pages -> all their chunks, most relevant first
+        for i in idx[np.argsort(-rrf)]:
             pid = self.chunks[i]["page"]
-            if pid in hits or len(hits) < k:
-                hits.setdefault(pid, []).append(int(i))
+            if pid not in hits:
+                if len(hits) >= k:
+                    continue
+                hits[pid] = []
+            hits[pid].append(int(i))
 
-        results, total = [], 0
-        for pid, cids in hits.items():
+        # Share the size budget: every page gets (remaining budget / remaining pages), so small
+        # pages leave room for the next ones. A page bigger than its share (or than FULL_PAGE)
+        # is cut down to its most relevant sections instead of being dropped.
+        results, remaining = [], max_chars
+        for n, (pid, cids) in enumerate(hits.items()):
             page = self.pages[pid]
-            if len(page["text"]) <= FULL_PAGE:
+            limit = min(FULL_PAGE, remaining // (len(hits) - n))
+            if len(page["text"]) <= limit:
                 body, whole = page["text"], True
             else:
-                cids = sorted(cids[:3])          # 3 best matching parts, shown in page order
-                body, whole = "\n\n[…]\n\n".join(self.chunks[c]["text"] for c in cids), False
-            if total + len(body) > max_chars and results:
-                continue
-            results.append({**page, "text": body, "whole": whole}); total += len(body)
+                chosen, size = [], 0
+                for c in cids:
+                    t = len(self.chunks[c]["text"]) + 7
+                    if chosen and size + t > limit:
+                        continue
+                    chosen.append(c); size += t
+                whole = len(chosen) == self.page_chunks[pid]
+                body = page["text"] if whole else "\n\n[…]\n\n".join(self.chunks[c]["text"] for c in sorted(chosen))
+            results.append({**page, "text": body, "whole": whole})
+            remaining -= len(body)
         return results
 
 # ---------------------------------------------------------------- embeddings
@@ -319,7 +336,8 @@ PAGE = """<!doctype html><meta charset=utf-8><title>docrag</title>
 input{width:75%;font-size:16px;padding:6px}button{font-size:16px;padding:6px 12px}
 textarea{width:100%;height:65vh;font:13px ui-monospace,monospace;margin-top:1em}</style>
 <form><input name=q value="{q}" autofocus placeholder="Ask about the docs…">
-<input name=k type=number value="{k}" style="width:4em" title="pages"><br>
+<input name=k type=number value="{k}" style="width:4em" title="number of pages"><br>
+<input name=size type=number value="{size}" step=1000 style="width:7em" title="total size budget (characters)">
 <input name=since value="{since}" placeholder="since YYYY-MM-DD" style="width:11em">
 <input name=source value="{source}" placeholder="source filter (e.g. channel)" style="width:16em">
 <button>Search</button></form>
@@ -334,13 +352,14 @@ def serve(index, port):
             qs = parse_qs(urlparse(self.path).query)
             q, k = qs.get("q", [""])[0], int(qs.get("k", ["5"])[0] or 5)
             since, source = qs.get("since", [""])[0].strip(), qs.get("source", [""])[0].strip()
+            size = int(qs.get("size", [str(MAX_CHARS)])[0] or MAX_CHARS)
             ctx, info = "", f"{len(index.pages)} pages, {len(index.chunks)} sections indexed"
             if q:
-                res = index.search(q, k=k, since=since or None, source=source or None)
+                res = index.search(q, k=k, max_chars=size, since=since or None, source=source or None)
                 ctx = format_context(q, res)
                 info = f"{len(res)} pages · {len(ctx):,} chars · " + " | ".join(r["title"] for r in res)
             body = PAGE.replace("{q}", html.escape(q)).replace("{k}", str(k)) \
-                       .replace("{since}", html.escape(since)).replace("{source}", html.escape(source)) \
+                       .replace("{size}", str(size)).replace("{since}", html.escape(since)).replace("{source}", html.escape(source)) \
                        .replace("{ctx}", html.escape(ctx)).replace("{info}", html.escape(info))
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers(); self.wfile.write(body.encode())
@@ -360,7 +379,7 @@ def main():
     a = sub.add_parser("ask", help="retrieve pages for a question")
     a.add_argument("question")
     a.add_argument("-k", type=int, default=5, help="number of pages (default 5)")
-    a.add_argument("--max-chars", type=int, default=24000, help="total size budget")
+    a.add_argument("--max-chars", type=int, default=MAX_CHARS, help="total size budget (characters)")
     a.add_argument("--since", help="only pages dated on/after YYYY-MM-DD (e.g. chat threads)")
     a.add_argument("--source", help="only pages whose source/file contains this text")
     a.add_argument("--out", help="write to a file (e.g. context.md) to attach in Copilot")
