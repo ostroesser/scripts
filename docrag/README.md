@@ -47,7 +47,8 @@ so only new content is embedded.
 The index goes to `./docrag_index` (change it with `DOCRAG_INDEX=/some/dir`).
 
 The first run downloads the embedding model (~470 MB, `intfloat/multilingual-e5-small`, FR+EN).
-**Behind a corporate proxy?** If the download is blocked, get the model folder once
+**Certificate errors** during `pip install` or the model download: run
+`bash ../wsl-certs/import-windows-certs.sh` once. **Still blocked?** If the download is refused, get the model folder once
 from Hugging Face and pass its local path: `--model /path/to/multilingual-e5-small`.
 
 ## Use it

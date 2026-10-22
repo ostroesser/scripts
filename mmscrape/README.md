@@ -29,8 +29,8 @@ export MM_TOKEN='<MMAUTHTOKEN value>'
 The cookie is your login: keep it out of files and the repo. When it expires, the scraper stops
 with "HTTP 401 … copy a fresh MMAUTHTOKEN", and you repeat step 2.
 
-**TLS error on an internal certificate?** Point `requests` at the corporate CA bundle:
-`export REQUESTS_CA_BUNDLE=/path/to/corporate-ca-bundle.pem`. Don't disable verification.
+**TLS / certificate error?** WSL doesn't trust the corporate CAs that Windows trusts. Run
+`bash ../wsl-certs/import-windows-certs.sh` once, then open a new terminal. Don't disable verification.
 
 ## Use it
 
