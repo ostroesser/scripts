@@ -47,6 +47,8 @@ so only new content is embedded.
 The index goes to `./docrag_index` (change it with `DOCRAG_INDEX=/some/dir`).
 
 The first run downloads the embedding model (~470 MB, `intfloat/multilingual-e5-small`, FR+EN).
+After that, docrag loads it from the local cache in offline mode, without contacting Hugging Face.
+Set `DOCRAG_OFFLINE=1` to never go online, even when the model is missing.
 **Certificate errors** during `pip install` or the model download: run
 `bash ../wsl-certs/import-windows-certs.sh` once. **Still blocked?** If the download is refused, get the model folder once
 from Hugging Face and pass its local path: `--model /path/to/multilingual-e5-small`.

@@ -296,9 +296,31 @@ def reuse_embeddings(texts, model_name, path=INDEX_DIR):
     return [cache.get(text_hash(t)) for t in texts]
 
 
+def model_is_cached(name):
+    """True if the model is a local folder or already in the Hugging Face cache."""
+    if Path(name).is_dir():
+        return True
+    hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
+        os.environ.get("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface"), "hub")
+    snapshots = Path(hub) / ("models--" + name.replace("/", "--")) / "snapshots"
+    return snapshots.is_dir() and any(snapshots.iterdir())
+
+
 def load_model(name):
+    """Load the embedding model without touching the network when it's already on disk.
+    Downloads it only if missing, unless DOCRAG_OFFLINE=1."""
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    cached = model_is_cached(name)
+    if cached:                                  # must be set before the HF libraries are imported
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    elif os.environ.get("DOCRAG_OFFLINE") == "1":
+        sys.exit(f"Model {name} is not downloaded and DOCRAG_OFFLINE=1. "
+                 "Run once without it, or pass --model /path/to/a/local/model/folder.")
+    else:
+        print(f"Model {name} not found locally, downloading it from Hugging Face …", file=sys.stderr)
     from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(name)
+    return SentenceTransformer(name, local_files_only=cached)
 
 
 def embed(model, name, texts, is_query=False):
