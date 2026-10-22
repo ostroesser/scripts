@@ -38,14 +38,19 @@ with "HTTP 401 … copy a fresh MMAUTHTOKEN", and you repeat step 2.
 python mmscrape.py channels                                # what you can sync (team/channel, size)
 python mmscrape.py sync team/team-support --since 2025-01-01   # first run: history since that date
 python mmscrape.py sync team/team-support                      # later runs: only what changed
+python mmscrape.py sync team/team-support --since 2023-01-01   # go further back: fetches the missing years
 python mmscrape.py sync https://<host>/team/channels/team-support other-team/other-channel
 
 python ../docrag/docrag.py ingest ../path/to/doc-export/*.txt mm_export/*.jsonl
 python ../docrag/docrag.py ask "deploy stuck on the deploy stage" --source "Team Support" --since 2026-01-01 --clip
 ```
 
-- `--since` on the first sync limits history. Busy support channels go back years, and old
-  answers are often stale. Without it, you get everything.
+- `--since` sets how far back the history goes. Busy support channels go back years, and old
+  answers are often stale. Without it, the first sync gets everything. Passing an earlier date
+  later fetches only the missing part; the same or a later date changes nothing.
+- Each run reports what actually changed (`N new, N edited, N deleted`) and how far back the
+  local copy goes. "Posts fetched" can be higher than "new": the API also returns posts that
+  are already stored, and system messages (joins, leaves) are fetched but not kept.
 - `--full` throws away the local copy and downloads again.
 - `render` rebuilds the exports from the local copy without touching the network.
 - Re-running `docrag ingest` is cheap: only new or changed threads are embedded again.
@@ -80,6 +85,10 @@ Each record:
   cursor. Rate limits (HTTP 429) are respected automatically.
 - Later runs: fetch pages until reaching posts already stored, then one `since` call to catch
   edits and deletions of older posts.
+- Going further back: continues from the oldest stored post down to the new `--since` date,
+  without fetching recent history again. (A local copy made before this feature existed gets one
+  walk from the newest post instead.)
+- Server errors (HTTP 5xx, network drops) are retried 4 times with increasing waits.
 - Replies whose thread started before `--since` get their whole thread fetched, so no thread is
   left without its question.
 

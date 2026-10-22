@@ -13,6 +13,8 @@ os.environ.update(MM_DATA=f"{TMP}/data", MM_EXPORT=f"{TMP}/export", MM_TZ="UTC")
 sys.path.insert(0, str(Path(__file__).parent))
 import mmscrape  # noqa: E402
 
+mmscrape.time.sleep = lambda s: None       # no real waiting in retries
+
 TOKEN = "good-token"
 DAY = 86_400_000
 T0 = 1_767_225_600_000                     # 2026-01-01 00:00 UTC
@@ -21,7 +23,7 @@ T0 = 1_767_225_600_000                     # 2026-01-01 00:00 UTC
 class Fake:
     """In-memory Mattermost: one team, one channel, users, posts."""
     def __init__(self):
-        self.posts, self.calls, self.rate_limit_once = {}, [], True
+        self.posts, self.calls, self.rate_limit_once, self.fail_before = {}, [], True, 0
         self.users = {"u1": ("Alice", "Martin"), "u2": ("Bob", "Dupont"), "u3": ("", "")}
 
     def add(self, pid, day, user, msg, root="", minute=0, **extra):
@@ -29,11 +31,19 @@ class Fake:
         self.posts[pid] = {"id": pid, "create_at": t, "update_at": t, "edit_at": 0, "delete_at": 0,
                            "user_id": user, "root_id": root, "message": msg, "type": "", "props": {}, **extra}
 
-    def live(self):
-        return sorted((p for p in self.posts.values() if not p["delete_at"]), key=lambda p: -p["create_at"])
+    def live(self, posts=None):
+        posts = self.posts if posts is None else posts
+        return sorted((p for p in posts.values() if not p["delete_at"]), key=lambda p: -p["create_at"])
 
 
 FAKE = Fake()
+HISTORY = {}                               # second channel: 100 posts a day, days 3 to 9
+for _d in range(3, 10):
+    for _i in range(100):
+        _t = T0 + _d * DAY + _i * 60_000
+        HISTORY[f"h{_d}-{_i:03d}"] = {"id": f"h{_d}-{_i:03d}", "create_at": _t, "update_at": _t, "edit_at": 0,
+                                      "delete_at": 0, "user_id": "u1", "root_id": "",
+                                      "message": f"history day {_d} #{_i}", "type": "", "props": {}}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -58,6 +68,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/teams/name/team1/channels/name/team-support":
             return self.reply(200, {"id": "c1", "name": "team-support", "display_name": "Team Support",
                                     "type": "O", "total_msg_count": len(FAKE.posts)})
+        if path == "/teams/name/team1/channels/name/history":
+            return self.reply(200, {"id": "c2", "name": "history", "display_name": "History",
+                                    "type": "O", "total_msg_count": len(HISTORY)})
+        if path == "/channels/c2/posts":
+            if q.get("before") and FAKE.fail_before:
+                FAKE.fail_before -= 1
+                return self.reply(500, {"id": "app.post.get_posts_around.get.app_error"})
+            if "since" in q:
+                ch = {p["id"]: p for p in HISTORY.values() if p["update_at"] >= int(q["since"])}
+                return self.reply(200, {"order": list(ch), "posts": ch})
+            live, per = FAKE.live(HISTORY), int(q.get("per_page", 60))
+            start = [p["id"] for p in live].index(q["before"]) + 1 if q.get("before") else 0
+            page = live[start:start + per]
+            return self.reply(200, {"order": [p["id"] for p in page], "posts": {p["id"]: p for p in page}})
         if path == "/users/me/teams":
             return self.reply(200, [{"id": "t1", "name": "team1"}])
         if path == "/users/me/teams/t1/channels":
@@ -68,6 +92,9 @@ class Handler(BaseHTTPRequestHandler):
             if FAKE.rate_limit_once:
                 FAKE.rate_limit_once = False
                 return self.reply(429, {"message": "slow down"}, {"Retry-After": "0"})
+            if q.get("before") and FAKE.fail_before:   # transient DB error, like a real 500
+                FAKE.fail_before -= 1
+                return self.reply(500, {"id": "app.post.get_posts_around.get.app_error"})
             if "since" in q:                   # changed posts, deleted ones included
                 ch = {p["id"]: p for p in FAKE.posts.values() if p["update_at"] >= int(q["since"])}
                 return self.reply(200, {"order": list(ch), "posts": ch})
@@ -178,6 +205,59 @@ class MMScrapeTest(unittest.TestCase):
         self.assertNotIn("s002", recs)
         pages = [c for c in FAKE.calls[n_calls:] if c[1] == "/channels/c1/posts" and "since" not in c[2]]
         self.assertEqual(len(pages), 1, "incremental run should stop after the first page")
+
+    def test_5_since_backfills_older_history(self):
+        mm = mmscrape.MM(self.url, TOKEN)
+        store_file = Path(TMP, "data", "c2.json")
+        def sync(**kw):
+            return run(mmscrape.sync, mm, "team1/history", **kw)
+
+        FAKE.fail_before = 1                                                # one 500 on a cursor call
+        out = sync(since="2026-01-08")                                      # day index 7
+        st = json.loads(store_file.read_text())
+        days = sorted({(p["create_at"] - T0) // DAY for p in st["posts"].values()})
+        self.assertEqual(days, [7, 8, 9], "nothing before --since")
+        self.assertEqual(st["covered_from"], mmscrape.date_ms("2026-01-08"))
+        self.assertIn("new", out)
+        n_first = len(st["posts"])
+
+        out = sync()                                                        # nothing changed
+        self.assertIn("0 new, 0 edited, 0 deleted", out)
+
+        out = sync(since="2026-01-08")                                      # same date: nothing to do
+        self.assertIn("already downloaded", out)
+
+        n_calls, cursor = len(FAKE.calls), st["covered_from_id"]
+        out = sync(since="2026-01-06")                                      # earlier: backfill the gap
+        st = json.loads(store_file.read_text())
+        days = sorted({(p["create_at"] - T0) // DAY for p in st["posts"].values()})
+        self.assertEqual(days, [5, 6, 7, 8, 9])
+        self.assertEqual(len(st["posts"]), n_first + 200)                   # 2 more days, 100 posts each
+        self.assertIn("200 new", out)
+        cursor_calls = [c for c in FAKE.calls[n_calls:] if c[1] == "/channels/c2/posts" and "before" in c[2]]
+        self.assertEqual(cursor_calls[0][2]["before"], cursor, "backfill starts from the oldest stored post")
+        self.assertLessEqual(len(cursor_calls), 2, "and doesn't walk the recent history again")
+
+        del st["covered_from"]                                              # store from an older version
+        store_file.write_text(json.dumps(st))
+        out = sync(since="2026-01-05")
+        st = json.loads(store_file.read_text())
+        self.assertEqual(sorted({(p["create_at"] - T0) // DAY for p in st["posts"].values()})[0], 4)
+        self.assertIn("100 new", out)
+        self.assertIn("walking from the newest post", out)
+
+        out = sync(since="2025-01-01")                                      # beyond the channel start
+        st = json.loads(store_file.read_text())
+        self.assertEqual(st["covered_from"], 0)
+        self.assertEqual(len(st["posts"]), len(HISTORY))
+        self.assertIn("whole channel", out)
+
+    def test_6_server_error_gives_up_cleanly(self):
+        FAKE.fail_before = 10
+        with self.assertRaises(SystemExit) as e:
+            run(mmscrape.sync, mmscrape.MM(self.url, TOKEN), "team1/history", since="2020-01-01", full=True)
+        self.assertIn("after 4 retries", str(e.exception))
+        FAKE.fail_before = 0
 
     def test_2_channel_list(self):
         out = run(mmscrape.list_channels, mmscrape.MM(self.url, TOKEN))

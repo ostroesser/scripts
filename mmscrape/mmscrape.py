@@ -35,6 +35,13 @@ EXPORT = Path(os.environ.get("MM_EXPORT", "./mm_export"))
 PER_PAGE = 200
 
 # ---------------------------------------------------------------- API client
+class ApiError(SystemExit):
+    """An API failure: stops the CLI with its message, but can be caught."""
+    def __init__(self, msg, status):
+        super().__init__(msg)
+        self.status = status
+
+
 class MM:
     def __init__(self, url, token):
         self.base = url.rstrip("/")
@@ -43,17 +50,31 @@ class MM:
                                "X-Requested-With": "XMLHttpRequest"})
 
     def call(self, method, path, **kw):
-        for _ in range(8):
-            r = self.s.request(method, f"{self.base}/api/v4{path}", timeout=60, **kw)
-            if r.status_code == 429:                # rate limited: wait as told, then retry
+        server_errors = 0
+        for _ in range(12):
+            try:
+                r = self.s.request(method, f"{self.base}/api/v4{path}", timeout=90, **kw)
+            except requests.ConnectionError as e:   # network hiccup: treat like a server error
+                r, err = None, str(e)
+            if r is not None and r.status_code == 429:   # rate limited: wait as told, then retry
                 wait = r.headers.get("Retry-After") or r.headers.get("X-Ratelimit-Reset") or 2
                 time.sleep(min(max(float(wait), 1), 60))
+                continue
+            if r is None or r.status_code >= 500:   # transient server error: back off and retry
+                server_errors += 1
+                if server_errors > 4:
+                    raise ApiError(f"\nServer error on {path} after 4 retries: "
+                                   f"{err if r is None else r.text[:300]}", 500 if r is None else r.status_code)
+                wait = 2 ** server_errors
+                print(f"\n  server error ({'network' if r is None else r.status_code}), retrying in {wait}s …",
+                      file=sys.stderr)
+                time.sleep(wait)
                 continue
             if r.status_code == 401:
                 sys.exit("\nHTTP 401: the session has expired or the token is wrong.\n"
                          "Copy a fresh MMAUTHTOKEN cookie from your browser into MM_TOKEN.")
             if r.status_code >= 400:
-                sys.exit(f"\nHTTP {r.status_code} on {path}: {r.text[:300]}")
+                raise ApiError(f"\nHTTP {r.status_code} on {path}: {r.text[:300]}", r.status_code)
             return r.json()
         sys.exit(f"\nStill rate limited after several retries on {path}. Try again later.")
 
@@ -97,17 +118,26 @@ def trim(p):
             "override_username": props.get("override_username")}
 
 
-def merge(store, posts):
-    """Merge raw API posts into the store: newest version wins, deleted and system posts are dropped."""
+def merge(store, posts, stats=None):
+    """Merge raw API posts into the store: newest version wins, deleted and system posts are dropped.
+    Counts real changes in stats: new, edited, deleted."""
+    stats = stats if stats is not None else {}
     for p in posts.values():
         if p.get("delete_at"):
-            store["posts"].pop(p["id"], None)
+            if store["posts"].pop(p["id"], None):
+                stats["deleted"] = stats.get("deleted", 0) + 1
         elif (p.get("type") or "").startswith("system_"):
             continue
         else:
             old = store["posts"].get(p["id"])
-            if not old or p.get("update_at", 0) >= old["update_at"]:
-                store["posts"][p["id"]] = trim(p)
+            if not old:
+                stats["new"] = stats.get("new", 0) + 1
+            elif p.get("update_at", 0) > old["update_at"]:
+                stats["edited"] = stats.get("edited", 0) + 1
+            else:
+                continue
+            store["posts"][p["id"]] = trim(p)
+    return stats
 
 # ---------------------------------------------------------------- fetching
 def date_ms(s):
@@ -130,32 +160,36 @@ def resolve(mm, ref):
     return team, mm.get(f"/teams/name/{team}/channels/name/{name}")
 
 
-def fetch_history(mm, channel_id, stop_at=None, since_ms=None):
-    """Walk the channel from newest to oldest with the `before` cursor.
-    Stops at posts we already have (stop_at) or older than the history limit (since_ms)."""
-    got, before = {}, ""
+def fetch_history(mm, channel_id, stop_at=None, since_ms=None, before=""):
+    """Walk the channel from newest to oldest with the `before` cursor (or from `before`).
+    Stops at posts we already have (stop_at), older than the history limit (since_ms),
+    or at the start of the channel.
+    Returns (posts, oldest walked post (create_at, id) or None, reached the channel start)."""
+    got, oldest, reached_start = {}, None, False
     while True:
         params = {"per_page": PER_PAGE}
         if before:
             params["before"] = before
         data = mm.get(f"/channels/{channel_id}/posts", **params)
         order, posts = data.get("order") or [], data.get("posts") or {}
-        done = not order
+        done = reached_start = not order
         for pid in order:
             p = posts[pid]
             if (stop_at is not None and p["create_at"] <= stop_at) or (since_ms and p["create_at"] < since_ms):
                 done = True
             else:
                 got[pid] = p
+                if oldest is None or p["create_at"] < oldest[0]:
+                    oldest = (p["create_at"], pid)
         for pid, p in posts.items():                # thread roots the API adds outside `order`
             if pid not in order and pid not in got:
                 got[pid] = p
-        print(f"\r  {len(got):,} posts downloaded …", end="", file=sys.stderr, flush=True)
+        print(f"\r  {len(got):,} posts fetched …", end="", file=sys.stderr, flush=True)
         if done:
             break
         before = order[-1]
     print(file=sys.stderr)
-    return got
+    return got, oldest, reached_start
 
 
 def fetch_missing_roots(mm, store, limit=1000):
@@ -192,15 +226,44 @@ def sync(mm, ref, full=False, since=None):
     label = f"{team}/{ch['name']}"
     started = int(time.time() * 1000)
 
+    since_ms = date_ms(since) if since else None
+    stats = {}
+
+    def walk_back(before=""):
+        """Fetch history from `before` (or the newest post) back to --since, remember how far we got."""
+        posts, oldest, reached_start = fetch_history(mm, ch["id"], since_ms=since_ms, before=before)
+        merge(store, posts, stats)
+        if reached_start or not since_ms:
+            store["covered_from"], store["covered_from_id"] = 0, None   # whole channel history
+        else:
+            store["covered_from"] = since_ms
+            if oldest:
+                store["covered_from_id"] = oldest[1]
+
     if not store["posts"]:
         print(f"{label}: full download" + (f" since {since}" if since else "") +
               f" (~{ch.get('total_msg_count', '?')} messages in channel)")
-        merge(store, fetch_history(mm, ch["id"], since_ms=date_ms(since) if since else None))
+        walk_back()
     else:
         print(f"{label}: incremental update")
-        merge(store, fetch_history(mm, ch["id"], stop_at=store["newest"]))
+        merge(store, fetch_history(mm, ch["id"], stop_at=store["newest"])[0], stats)
         # edits and deletions of older posts since the last run (5 min overlap)
-        merge(store, mm.get(f"/channels/{ch['id']}/posts", since=store["synced_at"] - 300_000).get("posts") or {})
+        merge(store, mm.get(f"/channels/{ch['id']}/posts", since=store["synced_at"] - 300_000).get("posts") or {}, stats)
+
+        covered = store.get("covered_from")     # None: store made by an older version, unknown
+        if since_ms is not None and (covered is None or since_ms < covered):
+            cursor = store.get("covered_from_id") if covered else None
+            print(f"{label}: fetching older history back to {since}"
+                  + ("" if cursor else " (walking from the newest post)"))
+            try:
+                walk_back(cursor or "")
+            except ApiError as e:               # cursor post gone (deleted): walk from the newest
+                if not cursor or e.status < 400 or e.status == 401:
+                    raise
+                print(f"  could not continue from the oldest stored post, walking from the newest", file=sys.stderr)
+                walk_back()
+        elif since_ms is not None:
+            print(f"{label}: history since {since} already downloaded")
 
     fetch_missing_roots(mm, store)
     store["newest"] = max((p["create_at"] for p in store["posts"].values()), default=0)
@@ -212,7 +275,11 @@ def sync(mm, ref, full=False, since=None):
     save_json(DATA / "users.json", users)
 
     out = write_export(store, users, mm.base)
-    print(f"{label}: {len(store['posts']):,} posts stored -> {out}")
+    changes = ", ".join(f"{stats.get(k, 0):,} {k}" for k in ("new", "edited", "deleted"))
+    span = ("whole channel" if store.get("covered_from") == 0 else
+            f"since {fmt_time(store['covered_from'], '%Y-%m-%d')}" if store.get("covered_from") else "")
+    print(f"{label}: {changes} -> {len(store['posts']):,} posts stored"
+          + (f" ({span})" if span else "") + f" -> {out}")
 
 # ---------------------------------------------------------------- rendering
 def fmt_time(ms, fmt="%Y-%m-%d %H:%M"):
@@ -298,7 +365,7 @@ def main():
     c.add_argument("--all", action="store_true", help="include direct and group messages")
     s = sub.add_parser("sync", help="download or update channels, then render them")
     s.add_argument("channels", nargs="+", help="team/channel or channel URL")
-    s.add_argument("--since", help="first download only: skip history before YYYY-MM-DD")
+    s.add_argument("--since", help="history start YYYY-MM-DD; an earlier date than before backfills the gap")
     s.add_argument("--full", action="store_true", help="discard the local copy and download again")
     sub.add_parser("render", help="re-render all synced channels (no network)")
     args = ap.parse_args()
