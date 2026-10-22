@@ -336,16 +336,22 @@ def text_hash(t):
     return hashlib.sha1(t.encode("utf-8")).hexdigest()
 
 
-def reuse_embeddings(texts, model_name, path=INDEX_DIR):
-    """Vectors from the previous index for identical text (same model); None where a new one is needed."""
-    try:
-        if json.loads((path / "meta.json").read_text(encoding="utf-8"))["model"] != model_name:
-            return [None] * len(texts)
-        old_chunks = json.loads((path / "chunks.json").read_text(encoding="utf-8"))
-        old_emb = np.load(path / "embeddings.npy")
-        cache = {c["hash"]: old_emb[i] for i, c in enumerate(old_chunks) if "hash" in c}
-    except (OSError, KeyError, ValueError):
-        return [None] * len(texts)
+def reuse_embeddings(texts, model_name, paths=(INDEX_DIR,)):
+    """Vectors for identical text from existing indexes (same model only); None where a new one is
+    needed. `paths`: the index being rebuilt, plus any other index to take vectors from."""
+    cache = {}
+    for path in paths:
+        path = Path(path)
+        try:
+            if json.loads((path / "meta.json").read_text(encoding="utf-8"))["model"] != model_name:
+                continue
+            old_chunks = json.loads((path / "chunks.json").read_text(encoding="utf-8"))
+            old_emb = np.load(path / "embeddings.npy")
+        except (OSError, KeyError, ValueError):
+            continue
+        for i, c in enumerate(old_chunks):
+            if "hash" in c:
+                cache.setdefault(c["hash"], old_emb[i])
     return [cache.get(text_hash(t)) for t in texts]
 
 
@@ -477,6 +483,8 @@ def main():
     i = sub.add_parser("ingest", help="build the index from export files")
     i.add_argument("files", nargs="+")
     i.add_argument("--model", default=DEFAULT_MODEL)
+    i.add_argument("--reuse", action="append", default=[], metavar="INDEX_DIR",
+                   help="also take vectors from this index (repeatable), e.g. to merge indexes")
     a = sub.add_parser("ask", help="retrieve pages for a question")
     a.add_argument("question")
     a.add_argument("-k", type=int, default=5, help="number of pages (default 5)")
@@ -496,7 +504,7 @@ def main():
               f"embedding with {args.model} …")
         titles = {p["id"]: p["title"] for p in pages}
         texts = [f"{titles[c['page']]} > {c['path']}\n{c['text']}" for c in chunks]
-        emb = reuse_embeddings(texts, args.model)          # unchanged sections keep their vectors
+        emb = reuse_embeddings(texts, args.model, [INDEX_DIR] + args.reuse)   # unchanged sections keep their vectors
         todo = [i for i, v in enumerate(emb) if v is None]
         print(f"{len(chunks) - len(todo)} sections unchanged, {len(todo)} to embed")
         if todo:

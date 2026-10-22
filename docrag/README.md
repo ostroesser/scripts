@@ -44,6 +44,13 @@ python docrag.py ingest export/*.txt ../mmscrape/mm_export/*.jsonl
 Re-run `ingest` whenever you re-scrape. Sections whose text didn't change keep their vectors,
 so only new content is embedded.
 
+To merge existing indexes into one without recomputing, ingest all the files into the new
+index and point `--reuse` at the old ones:
+
+```bash
+DOCRAG_INDEX=./idx-all python docrag.py ingest docs/*.txt mm_export/*.jsonl --reuse ./idx-docs --reuse ./idx-chat
+```
+
 The index goes to `./docrag_index` (change it with `DOCRAG_INDEX=/some/dir`).
 
 The first run downloads the embedding model (~470 MB, `intfloat/multilingual-e5-small`, FR+EN).
