@@ -337,8 +337,11 @@ def embed(model, name, texts, is_query=False):
 
 # ---------------------------------------------------------------- output
 def format_context(question, results):
-    parts = ["Use only the pages below (documentation and/or chat threads) to answer. Cite the page title and URL you rely on.\n"
-             f"If the pages don't contain the answer, say so.\n\nQuestion: {question}\n"]
+    # The question comes first, on its own line: Copilot uses the start of the message
+    # as the conversation title in its sidebar.
+    parts = [f"{question.strip()}\n\n"
+             "Use only the pages below (documentation and/or chat threads) to answer the question above. "
+             "Cite the page title and URL you rely on.\nIf the pages don't contain the answer, say so.\n"]
     for n, r in enumerate(results, 1):
         note = "" if r["whole"] else " (relevant extracts)"
         date = f"\nDate: {r['date']}" if r.get("date") else ""

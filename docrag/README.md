@@ -63,8 +63,9 @@ python docrag.py ask "..." --source "Team Support" --since 2026-01-01   # only t
 python docrag.py serve     # browser page at http://localhost:8765 with a "Copy for Copilot" button
 ```
 
-The output is a short instruction ("answer only from these pages, cite title and URL"),
-then the question, then the pages. Paste it as-is.
+The output starts with your question (so Copilot uses it as the conversation title), then a
+short instruction ("answer only from these pages, cite title and URL"), then the pages.
+Paste it as-is.
 
 Filters (CLI and web page):
 - `--source TEXT`: keep pages whose source or file name contains TEXT (a channel name, a doc export file).
