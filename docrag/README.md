@@ -61,7 +61,11 @@ The index goes to `./docrag_index` (change it with `DOCRAG_INDEX=/some/dir`).
 | Reranker (`--reranker`) | `Qwen/Qwen3-Reranker-0.6B` | Re-reads the 20 best sections of each search and reorders them. Apache 2.0. |
 
 - **Indexing is CPU-heavy** with this model: the first full ingest of a large chat history can
-  take an hour or more on a laptop. Later ingests only embed new or changed sections.
+  take hours on a laptop. Later ingests only embed new or changed sections. Ingest shows its
+  speed and time left, and can be stopped (Ctrl+C) and resumed: finished blocks of 256 sections
+  are kept and the next run picks up where it stopped.
+- Models are loaded in float32: some (like Qwen3) are saved in bfloat16, which laptop CPUs
+  emulate several times slower.
 - **An existing index keeps the model it was built with**, so changing the model means a full
   re-ingest (vectors from different models can't be mixed). To stay on a lighter model:
   `ingest --model BAAI/bge-small-en-v1.5` (fast, English) or `--model intfloat/multilingual-e5-small`.

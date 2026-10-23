@@ -367,6 +367,30 @@ def text_hash(t):
     return hashlib.sha1(t.encode("utf-8")).hexdigest()
 
 
+PARTIAL = "partial"     # sub-folder of an index: blocks embedded by an unfinished ingest
+
+
+def save_partial(index_dir, model_name, n, hashes, vectors):
+    d = Path(index_dir) / PARTIAL
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "model.txt").write_text(model_name, encoding="utf-8")
+    np.save(d / f"{n:06d}.npy", vectors)
+    (d / f"{n:06d}.json").write_text(json.dumps(hashes), encoding="utf-8")
+
+
+def load_partial(index_dir, model_name):
+    d, cache = Path(index_dir) / PARTIAL, {}
+    try:
+        if (d / "model.txt").read_text(encoding="utf-8") != model_name:
+            return cache
+        for f in sorted(d.glob("*.json")):
+            vectors = np.load(f.with_suffix(".npy"))
+            cache.update(zip(json.loads(f.read_text(encoding="utf-8")), vectors))
+    except (OSError, ValueError):
+        pass
+    return cache
+
+
 def reuse_embeddings(texts, model_name, paths=(INDEX_DIR,)):
     """Vectors for identical text from existing indexes (same model only); None where a new one is
     needed. `paths`: the index being rebuilt, plus any other index to take vectors from."""
@@ -383,6 +407,9 @@ def reuse_embeddings(texts, model_name, paths=(INDEX_DIR,)):
         for i, c in enumerate(old_chunks):
             if "hash" in c:
                 cache.setdefault(c["hash"], old_emb[i])
+    for path in paths:                          # blocks left by an interrupted ingest
+        for h, v in load_partial(path, model_name).items():
+            cache.setdefault(h, v)
     return [cache.get(text_hash(t)) for t in texts]
 
 
@@ -416,11 +443,20 @@ def prepare_hf(name):
     return cached
 
 
+def float32_kwargs():
+    """Load weights in float32: models saved in bfloat16 (like Qwen3) are several times slower on
+    laptop CPUs, which emulate bfloat16. transformers renamed the argument in 4.56."""
+    import torch
+    import transformers
+    major, minor = (int(x) for x in re.findall(r"\d+", transformers.__version__)[:2])
+    return {"dtype" if (major, minor) >= (4, 56) else "torch_dtype": torch.float32}
+
+
 def load_model(name):
     """Load the embedding model, without touching the network when it's already on disk."""
     cached = prepare_hf(name)
     from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer(name, local_files_only=cached)
+    model = SentenceTransformer(name, local_files_only=cached, model_kwargs=float32_kwargs())
     if getattr(model, "max_seq_length", None):
         model.max_seq_length = min(model.max_seq_length, MAX_TOKENS)
     return model
@@ -442,12 +478,13 @@ def prompts_for(name):
     return "", ""
 
 
-def embed(model, name, texts, is_query=False):
+def embed(model, name, texts, is_query=False, progress=None):
     query_prefix, passage_prefix = prompts_for(name)
     prefix = query_prefix if is_query else passage_prefix
     if prefix:
         texts = [prefix + t for t in texts]
-    v = model.encode(texts, batch_size=16, show_progress_bar=not is_query, normalize_embeddings=True)
+    v = model.encode(texts, batch_size=16, normalize_embeddings=True,
+                     show_progress_bar=(not is_query) if progress is None else progress)
     return np.asarray(v, dtype=np.float32)
 
 
@@ -467,7 +504,8 @@ class Reranker:
             from transformers import AutoModelForCausalLM, AutoTokenizer
             self.torch = torch
             self.tok = AutoTokenizer.from_pretrained(name, padding_side="left", local_files_only=cached)
-            self.lm = AutoModelForCausalLM.from_pretrained(name, local_files_only=cached).eval()
+            self.lm = AutoModelForCausalLM.from_pretrained(name, local_files_only=cached,
+                                                           **float32_kwargs()).eval()
             self.yes = self.tok.convert_tokens_to_ids("yes")
             self.no = self.tok.convert_tokens_to_ids("no")
             self.prefix = self.tok.encode(
@@ -478,7 +516,11 @@ class Reranker:
                                           add_special_tokens=False)
         else:
             from sentence_transformers import CrossEncoder
-            self.ce = CrossEncoder(name, max_length=MAX_TOKENS, local_files_only=cached)
+            try:
+                self.ce = CrossEncoder(name, max_length=MAX_TOKENS, local_files_only=cached,
+                                       model_kwargs=float32_kwargs())
+            except TypeError:                   # older sentence-transformers: no model_kwargs
+                self.ce = CrossEncoder(name, max_length=MAX_TOKENS, local_files_only=cached)
 
     def score(self, question, passages, batch=4):
         if not passages:
@@ -633,9 +675,20 @@ def main():
         todo = [i for i, v in enumerate(emb) if v is None]
         print(f"{len(chunks) - len(todo)} sections unchanged, {len(todo)} to embed")
         if todo:
-            new = embed(load_model(args.model), args.model, [texts[i] for i in todo])
-            for i, v in zip(todo, new):
-                emb[i] = v
+            model, block, t0 = load_model(args.model), 256, time.time()
+            start_n = len(list((INDEX_DIR / PARTIAL).glob("*.json"))) if (INDEX_DIR / PARTIAL).is_dir() else 0
+            for b, s0 in enumerate(range(0, len(todo), block)):
+                ids = todo[s0:s0 + block]
+                new = embed(model, args.model, [texts[i] for i in ids], progress=False)
+                for i, v in zip(ids, new):
+                    emb[i] = v
+                save_partial(INDEX_DIR, args.model, start_n + b, [text_hash(texts[i]) for i in ids], new)
+                done, elapsed = s0 + len(ids), time.time() - t0
+                left = elapsed / done * (len(todo) - done)
+                print(f"\r  {done:,}/{len(todo):,} sections embedded, {done / elapsed:.1f}/s, "
+                      f"about {int(left // 3600)}h{int(left % 3600 // 60):02d} left "
+                      f"(safe to stop: done blocks are kept)  ", end="", file=sys.stderr, flush=True)
+            print(file=sys.stderr)
         emb = np.vstack(emb).astype(np.float32) if emb else np.zeros((0, 1), dtype=np.float32)
         for c, t in zip(chunks, texts):
             c["hash"] = text_hash(t)
@@ -644,6 +697,8 @@ def main():
         (INDEX_DIR / "pages.json").write_text(json.dumps(pages, ensure_ascii=False), encoding="utf-8")
         (INDEX_DIR / "chunks.json").write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
         (INDEX_DIR / "meta.json").write_text(json.dumps({"model": args.model}), encoding="utf-8")
+        import shutil
+        shutil.rmtree(INDEX_DIR / PARTIAL, ignore_errors=True)   # all saved in the index now
         print(f"Index written to {INDEX_DIR.resolve()}")
     elif args.cmd == "ask":
         idx = Index(reranker=None if args.no_rerank else args.reranker)
