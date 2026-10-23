@@ -58,12 +58,13 @@ The index goes to `./docrag_index` (change it with `DOCRAG_INDEX=/some/dir`).
 | Role | Model | Size |
 |---|---|---|
 | Search (`ingest --model`) | `BAAI/bge-small-en-v1.5` | 33M parameters, ~130 MB, fast on a laptop CPU |
-| Reranker (`serve`/`ask --reranker`) | `cross-encoder/ms-marco-MiniLM-L-6-v2` | 22M parameters, ~90 MB, about a second per search |
+| Reranker (`serve`/`ask --reranker`) | `cross-encoder/ms-marco-MiniLM-L-6-v2` | 22M parameters, ~90 MB, a few seconds per search on CPU |
 
 - **An index keeps the model it was built with**, so changing the model means a full re-ingest
   (vectors from different models can't be mixed). Ingest shows its speed and time left, and can
   be stopped (Ctrl+C) and resumed: finished blocks of 256 sections are kept.
-- **Reranking** re-reads the 20 best sections with the question and reorders them. Turn it off
+- **Reranking** re-reads the 100 best sections with the question and reorders them, so a
+  relevant page the first pass ranked low can still reach the top. Turn it off
   per search with the **Ranking** switch on the web page or `ask --no-rerank`, or entirely with
   `serve --no-rerank`. If the reranker can't be loaded, searches still work, with a warning.
 - Models are downloaded on first use, then loaded from the local cache in offline mode, without
@@ -123,7 +124,7 @@ The page talks to two endpoints you can also script against: `GET /api/sources` 
   matching, and the hits are grouped back by page.
 - **Hybrid search.** Exact terms (image names like `rhel9-base`, property keys, error codes) are
   matched by keywords, and paraphrased questions by meaning. The reranker then re-reads the
-  20 best sections with the question and puts the ones that actually answer it first.
+  100 best sections with the question and puts the ones that actually answer it first.
 - **Doc titles lose the site name** that doc sites append to every page ("Page - Site"),
   when every page of an export has the same suffix.
 - **Markdown links are reduced to their label** (`[Java Images](https://…)` → `Java Images`).

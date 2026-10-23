@@ -30,7 +30,7 @@ INDEX_DIR = Path(os.environ.get("DOCRAG_INDEX", "./docrag_index"))
 # Small models: fast on a laptop CPU
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"           # 33M params, fast, good English retrieval
 DEFAULT_RERANKER = "cross-encoder/ms-marco-MiniLM-L-6-v2"   # 22M params, ~1 s per search
-RERANK_CANDIDATES = 20                             # sections the reranker re-reads per question
+RERANK_CANDIDATES = 100                            # sections the reranker re-reads per question
 MAX_TOKENS = 512                                   # sections are short; caps CPU time per section
 MAX_CHUNK = 1800       # chars per searchable section (the model reads ~512 tokens)
 MIN_CHUNK = 250        # tiny sections get merged with their neighbour
@@ -323,10 +323,11 @@ class Index:
         if rerank and len(ranked) > 1:         # re-read the best candidates and reorder them
             rr = self.reranker()
             if rr is not None:
-                head = ranked[:RERANK_CANDIDATES]
+                n = max(RERANK_CANDIDATES, k * 5)      # enough candidates for the pages asked for
+                head = ranked[:n]
                 scores = rr.score(question, [f"{self.chunk_header(self.chunks[i])}\n{self.chunks[i]['text']}"
                                              for i in head])
-                ranked = np.concatenate([head[np.argsort(-scores, kind="stable")], ranked[RERANK_CANDIDATES:]])
+                ranked = np.concatenate([head[np.argsort(-scores, kind="stable")], ranked[n:]])
                 self.last_reranked = True
 
         hits = {}                              # k best pages -> all their chunks, most relevant first
