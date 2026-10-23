@@ -9,7 +9,7 @@ No LLM, nothing leaves your machine.
 ```bash
 python3 -m venv ~/docrag-venv && source ~/docrag-venv/bin/activate
 pip install torch --index-url https://download.pytorch.org/whl/cpu   # CPU-only torch, much smaller
-pip install -U "sentence-transformers>=2.7" "transformers>=4.51" numpy
+pip install sentence-transformers numpy
 ```
 
 ## Build the index
@@ -55,35 +55,19 @@ The index goes to `./docrag_index` (change it with `DOCRAG_INDEX=/some/dir`).
 
 ## Models
 
-Defaults are sized for a laptop CPU:
-
-| Role | Default | Size |
+| Role | Model | Size |
 |---|---|---|
-| Embedding (`ingest --model`) | `BAAI/bge-small-en-v1.5` | 33M parameters, ~130 MB |
-| Reranker (`serve`/`ask --reranker`) | `cross-encoder/ms-marco-MiniLM-L-6-v2` | 22M parameters, ~90 MB |
-
-**Measure before switching to a bigger model.** Cost grows with model size: on a laptop CPU,
-`Qwen/Qwen3-Embedding-0.6B` (the best under 1B on benchmarks) needs on the order of a second per
-section, i.e. many hours for a large chat history, and the Qwen3 reranker adds tens of seconds
-to each search. `bench` times candidates on a sample of your own sections:
-
-```bash
-python docrag.py bench docs/*.txt mm_export/*.jsonl
-python docrag.py bench docs/*.txt --models BAAI/bge-small-en-v1.5 BAAI/bge-base-en-v1.5 --rerankers BAAI/bge-reranker-base
-```
-
-It prints sections per second and the projected time to index everything for each embedding
-model, and the delay each reranker adds to a search. Models that can't be downloaded are skipped.
+| Search (`ingest --model`) | `BAAI/bge-small-en-v1.5` | 33M parameters, ~130 MB, fast on a laptop CPU |
+| Reranker (`serve`/`ask --reranker`) | `cross-encoder/ms-marco-MiniLM-L-6-v2` | 22M parameters, ~90 MB, about a second per search |
 
 - **An index keeps the model it was built with**, so changing the model means a full re-ingest
   (vectors from different models can't be mixed). Ingest shows its speed and time left, and can
   be stopped (Ctrl+C) and resumed: finished blocks of 256 sections are kept.
-- **Reranking** re-reads the 20 best sections and reorders them. Turn it off per search with the
-  **Ranking** switch on the web page (Fast/Precise) or `ask --no-rerank`, or entirely with
+- **Reranking** re-reads the 20 best sections with the question and reorders them. Turn it off
+  per search with the **Ranking** switch on the web page or `ask --no-rerank`, or entirely with
   `serve --no-rerank`. If the reranker can't be loaded, searches still work, with a warning.
-- Models are loaded in float32 (some are saved in bfloat16, which laptop CPUs emulate slowly),
-  downloaded on first use, then loaded from the local cache in offline mode without contacting
-  Hugging Face. `DOCRAG_OFFLINE=1` forbids downloads.
+- Models are downloaded on first use, then loaded from the local cache in offline mode, without
+  contacting Hugging Face. `DOCRAG_OFFLINE=1` forbids downloads.
 **Certificate errors** during `pip install` or the model download: run
 `bash ../wsl-certs/import-windows-certs.sh` once. **Still blocked?** If the download is refused, get the model folder once
 from Hugging Face and pass its local path: `--model /path/to/model-folder` (same for `--reranker`).

@@ -27,13 +27,9 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 
 INDEX_DIR = Path(os.environ.get("DOCRAG_INDEX", "./docrag_index"))
-# Defaults sized for a laptop CPU (measure yours with: docrag.py bench <files>)
+# Small models: fast on a laptop CPU
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"           # 33M params, fast, good English retrieval
 DEFAULT_RERANKER = "cross-encoder/ms-marco-MiniLM-L-6-v2"   # 22M params, ~1 s per search
-BENCH_MODELS = ["BAAI/bge-small-en-v1.5", "ibm-granite/granite-embedding-small-english-r2",
-                "BAAI/bge-base-en-v1.5", "Qwen/Qwen3-Embedding-0.6B"]
-BENCH_RERANKERS = ["cross-encoder/ms-marco-MiniLM-L-6-v2", "BAAI/bge-reranker-base",
-                   "Qwen/Qwen3-Reranker-0.6B"]
 RERANK_CANDIDATES = 20                             # sections the reranker re-reads per question
 MAX_TOKENS = 512                                   # sections are short; caps CPU time per section
 MAX_CHUNK = 1800       # chars per searchable section (the model reads ~512 tokens)
@@ -448,34 +444,19 @@ def prepare_hf(name):
     return cached
 
 
-def float32_kwargs():
-    """Load weights in float32: models saved in bfloat16 (like Qwen3) are several times slower on
-    laptop CPUs, which emulate bfloat16. transformers renamed the argument in 4.56."""
-    import torch
-    import transformers
-    major, minor = (int(x) for x in re.findall(r"\d+", transformers.__version__)[:2])
-    return {"dtype" if (major, minor) >= (4, 56) else "torch_dtype": torch.float32}
-
-
 def load_model(name):
     """Load the embedding model, without touching the network when it's already on disk."""
     cached = prepare_hf(name)
     from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer(name, local_files_only=cached, model_kwargs=float32_kwargs())
+    model = SentenceTransformer(name, local_files_only=cached)
     if getattr(model, "max_seq_length", None):
         model.max_seq_length = min(model.max_seq_length, MAX_TOKENS)
     return model
 
 
-# Query/passage conventions differ per model family. Documents never get an instruction.
-QWEN_QUERY = ("Instruct: Given a technical question, retrieve documentation pages and chat "
-              "discussions that answer it\nQuery:")
-
-
 def prompts_for(name):
+    """Query/passage prefixes some model families expect."""
     n = name.lower()
-    if "qwen3-embedding" in n:
-        return QWEN_QUERY, ""
     if "e5" in n:
         return "query: ", "passage: "
     if "bge-" in n and "en-v1.5" in n:
@@ -494,58 +475,18 @@ def embed(model, name, texts, is_query=False, progress=None):
 
 
 class Reranker:
-    """Scores (question, section) pairs; higher is more relevant.
-    Qwen3-Reranker is a small LM asked "does this document answer the query? yes/no" (the method
-    from its model card, independent of the sentence-transformers version); other rerankers go
-    through sentence-transformers' CrossEncoder."""
-    INSTRUCT = "Given a technical question, judge whether the passage helps answer it"
+    """Scores (question, section) pairs with a cross-encoder; higher is more relevant."""
 
     def __init__(self, name):
         self.name = name
         cached = prepare_hf(name)
-        self.qwen = "qwen3-reranker" in name.lower()
-        if self.qwen:
-            import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-            self.torch = torch
-            self.tok = AutoTokenizer.from_pretrained(name, padding_side="left", local_files_only=cached)
-            self.lm = AutoModelForCausalLM.from_pretrained(name, local_files_only=cached,
-                                                           **float32_kwargs()).eval()
-            self.yes = self.tok.convert_tokens_to_ids("yes")
-            self.no = self.tok.convert_tokens_to_ids("no")
-            self.prefix = self.tok.encode(
-                "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query "
-                "and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n"
-                "<|im_start|>user\n", add_special_tokens=False)
-            self.suffix = self.tok.encode("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
-                                          add_special_tokens=False)
-        else:
-            from sentence_transformers import CrossEncoder
-            try:
-                self.ce = CrossEncoder(name, max_length=MAX_TOKENS, local_files_only=cached,
-                                       model_kwargs=float32_kwargs())
-            except TypeError:                   # older sentence-transformers: no model_kwargs
-                self.ce = CrossEncoder(name, max_length=MAX_TOKENS, local_files_only=cached)
+        from sentence_transformers import CrossEncoder
+        self.ce = CrossEncoder(name, max_length=MAX_TOKENS, local_files_only=cached)
 
-    def score(self, question, passages, batch=4):
+    def score(self, question, passages):
         if not passages:
             return np.zeros(0)
-        if not self.qwen:
-            return np.asarray(self.ce.predict([(question, p) for p in passages], batch_size=batch), dtype=float)
-        out = []
-        room = MAX_TOKENS - len(self.prefix) - len(self.suffix)
-        for i in range(0, len(passages), batch):
-            pairs = [f"<Instruct>: {self.INSTRUCT}\n<Query>: {question}\n<Document>: {p}"
-                     for p in passages[i:i + batch]]
-            enc = self.tok(pairs, padding=False, truncation="longest_first",
-                           return_attention_mask=False, max_length=room)
-            enc["input_ids"] = [self.prefix + ids + self.suffix for ids in enc["input_ids"]]
-            enc = self.tok.pad(enc, padding=True, return_tensors="pt")
-            with self.torch.no_grad():
-                logits = self.lm(**enc).logits[:, -1, :]
-            pair = self.torch.stack([logits[:, self.no], logits[:, self.yes]], dim=1)
-            out.extend(self.torch.nn.functional.log_softmax(pair, dim=1)[:, 1].exp().tolist())
-        return np.asarray(out, dtype=float)
+        return np.asarray(self.ce.predict([(question, p) for p in passages], batch_size=16), dtype=float)
 
 
 # ---------------------------------------------------------------- output
@@ -644,53 +585,6 @@ def serve(index, port, host="127.0.0.1"):
     print(f"docrag on http://localhost:{port}  ({len(index.pages)} pages)  Ctrl+C to stop")
     HTTPServer((host, port), H).serve_forever()
 
-# ---------------------------------------------------------------- benchmark
-def fmt_duration(sec):
-    sec = int(sec)
-    return f"{sec // 3600}h{sec % 3600 // 60:02d}" if sec >= 3600 else f"{sec // 60}m{sec % 60:02d}s"
-
-
-def bench(files, models, rerankers, n=64):
-    """Measure models on a sample of your own sections: indexing time for everything, and the
-    delay the reranker adds to each search."""
-    pages, chunks = build(files)
-    titles = {p["id"]: p["title"] for p in pages}
-    texts = [f"{titles[c['page']]} > {c['path']}\n{c['text']}" for c in chunks]
-    if not texts:
-        sys.exit("No sections found in these files.")
-    step = max(1, len(texts) // n)
-    sample = texts[::step][:n]                  # spread over the whole corpus, not just the first file
-    question = "How do I fix a deployment that is stuck after the image scan?"
-    NEEDED_MODELS.update(models + rerankers)    # offline only if all of them are already downloaded
-    print(f"{len(texts):,} sections in total; timing {len(sample)} of them on this machine.\n")
-
-    print(f"{'Embedding model':<50} {'sections/s':>10} {'index everything':>17}")
-    for name in models:
-        try:
-            m = load_model(name)
-            embed(m, name, sample[:4], progress=False)          # warm-up, not timed
-            t0 = time.time()
-            embed(m, name, sample, progress=False)
-            rate = len(sample) / (time.time() - t0)
-            print(f"{name:<50} {rate:>10.1f} {fmt_duration(len(texts) / rate):>17}", flush=True)
-            del m
-        except (Exception, SystemExit) as e:
-            print(f"{name:<50} failed: {type(e).__name__}: {str(e)[:80]}", flush=True)
-
-    print(f"\n{'Reranker':<50} {'added to each search':>21}")
-    for name in rerankers:
-        try:
-            r = Reranker(name)
-            r.score(question, sample[:2])                         # warm-up
-            t0 = time.time()
-            r.score(question, sample[:RERANK_CANDIDATES])
-            print(f"{name:<50} {time.time() - t0:>19.1f} s", flush=True)
-            del r
-        except (Exception, SystemExit) as e:
-            print(f"{name:<50} failed: {type(e).__name__}: {str(e)[:80]}", flush=True)
-    print("\nPick a model with: ingest --model NAME   and a reranker with: serve/ask --reranker NAME")
-
-
 # ---------------------------------------------------------------- CLI
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -710,11 +604,6 @@ def main():
     a.add_argument("--clip", action="store_true", help="copy to the Windows clipboard")
     a.add_argument("--no-rerank", action="store_true", help="skip the reranker (faster, less precise)")
     a.add_argument("--reranker", default=DEFAULT_RERANKER, help="reranker model (default %(default)s)")
-    bp = sub.add_parser("bench", help="time embedding models and rerankers on your own files")
-    bp.add_argument("files", nargs="+")
-    bp.add_argument("--models", nargs="+", default=BENCH_MODELS)
-    bp.add_argument("--rerankers", nargs="+", default=BENCH_RERANKERS)
-    bp.add_argument("-n", type=int, default=64, help="sections to time (default 64)")
     s = sub.add_parser("serve", help="web page with a copy button")
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--host", default="127.0.0.1", help="listen address (default: this machine only)")
@@ -759,8 +648,6 @@ def main():
         import shutil
         shutil.rmtree(INDEX_DIR / PARTIAL, ignore_errors=True)   # all saved in the index now
         print(f"Index written to {INDEX_DIR.resolve()}")
-    elif args.cmd == "bench":
-        bench(args.files, args.models, args.rerankers, args.n)
     elif args.cmd == "ask":
         idx = Index(reranker=None if args.no_rerank else args.reranker)
         res = idx.search(args.question, args.k, args.max_chars, since=args.since, source=args.source,
