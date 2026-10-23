@@ -677,6 +677,8 @@ def main():
         if todo:
             model, block, t0 = load_model(args.model), 256, time.time()
             start_n = len(list((INDEX_DIR / PARTIAL).glob("*.json"))) if (INDEX_DIR / PARTIAL).is_dir() else 0
+            print(f"  embedding in blocks of {block}; speed and time left appear after the first block …",
+                  file=sys.stderr, flush=True)
             for b, s0 in enumerate(range(0, len(todo), block)):
                 ids = todo[s0:s0 + block]
                 new = embed(model, args.model, [texts[i] for i in ids], progress=False)
