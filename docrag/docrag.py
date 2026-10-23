@@ -27,8 +27,13 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 
 INDEX_DIR = Path(os.environ.get("DOCRAG_INDEX", "./docrag_index"))
-DEFAULT_MODEL = "Qwen/Qwen3-Embedding-0.6B"        # best open model < 1B for English retrieval
-DEFAULT_RERANKER = "Qwen/Qwen3-Reranker-0.6B"      # re-reads the best sections, reorders them
+# Defaults sized for a laptop CPU (measure yours with: docrag.py bench <files>)
+DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"           # 33M params, fast, good English retrieval
+DEFAULT_RERANKER = "cross-encoder/ms-marco-MiniLM-L-6-v2"   # 22M params, ~1 s per search
+BENCH_MODELS = ["BAAI/bge-small-en-v1.5", "ibm-granite/granite-embedding-small-english-r2",
+                "BAAI/bge-base-en-v1.5", "Qwen/Qwen3-Embedding-0.6B"]
+BENCH_RERANKERS = ["cross-encoder/ms-marco-MiniLM-L-6-v2", "BAAI/bge-reranker-base",
+                   "Qwen/Qwen3-Reranker-0.6B"]
 RERANK_CANDIDATES = 20                             # sections the reranker re-reads per question
 MAX_TOKENS = 512                                   # sections are short; caps CPU time per section
 MAX_CHUNK = 1800       # chars per searchable section (the model reads ~512 tokens)
@@ -639,6 +644,53 @@ def serve(index, port, host="127.0.0.1"):
     print(f"docrag on http://localhost:{port}  ({len(index.pages)} pages)  Ctrl+C to stop")
     HTTPServer((host, port), H).serve_forever()
 
+# ---------------------------------------------------------------- benchmark
+def fmt_duration(sec):
+    sec = int(sec)
+    return f"{sec // 3600}h{sec % 3600 // 60:02d}" if sec >= 3600 else f"{sec // 60}m{sec % 60:02d}s"
+
+
+def bench(files, models, rerankers, n=64):
+    """Measure models on a sample of your own sections: indexing time for everything, and the
+    delay the reranker adds to each search."""
+    pages, chunks = build(files)
+    titles = {p["id"]: p["title"] for p in pages}
+    texts = [f"{titles[c['page']]} > {c['path']}\n{c['text']}" for c in chunks]
+    if not texts:
+        sys.exit("No sections found in these files.")
+    step = max(1, len(texts) // n)
+    sample = texts[::step][:n]                  # spread over the whole corpus, not just the first file
+    question = "How do I fix a deployment that is stuck after the image scan?"
+    NEEDED_MODELS.update(models + rerankers)    # offline only if all of them are already downloaded
+    print(f"{len(texts):,} sections in total; timing {len(sample)} of them on this machine.\n")
+
+    print(f"{'Embedding model':<50} {'sections/s':>10} {'index everything':>17}")
+    for name in models:
+        try:
+            m = load_model(name)
+            embed(m, name, sample[:4], progress=False)          # warm-up, not timed
+            t0 = time.time()
+            embed(m, name, sample, progress=False)
+            rate = len(sample) / (time.time() - t0)
+            print(f"{name:<50} {rate:>10.1f} {fmt_duration(len(texts) / rate):>17}", flush=True)
+            del m
+        except (Exception, SystemExit) as e:
+            print(f"{name:<50} failed: {type(e).__name__}: {str(e)[:80]}", flush=True)
+
+    print(f"\n{'Reranker':<50} {'added to each search':>21}")
+    for name in rerankers:
+        try:
+            r = Reranker(name)
+            r.score(question, sample[:2])                         # warm-up
+            t0 = time.time()
+            r.score(question, sample[:RERANK_CANDIDATES])
+            print(f"{name:<50} {time.time() - t0:>19.1f} s", flush=True)
+            del r
+        except (Exception, SystemExit) as e:
+            print(f"{name:<50} failed: {type(e).__name__}: {str(e)[:80]}", flush=True)
+    print("\nPick a model with: ingest --model NAME   and a reranker with: serve/ask --reranker NAME")
+
+
 # ---------------------------------------------------------------- CLI
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -658,6 +710,11 @@ def main():
     a.add_argument("--clip", action="store_true", help="copy to the Windows clipboard")
     a.add_argument("--no-rerank", action="store_true", help="skip the reranker (faster, less precise)")
     a.add_argument("--reranker", default=DEFAULT_RERANKER, help="reranker model (default %(default)s)")
+    bp = sub.add_parser("bench", help="time embedding models and rerankers on your own files")
+    bp.add_argument("files", nargs="+")
+    bp.add_argument("--models", nargs="+", default=BENCH_MODELS)
+    bp.add_argument("--rerankers", nargs="+", default=BENCH_RERANKERS)
+    bp.add_argument("-n", type=int, default=64, help="sections to time (default 64)")
     s = sub.add_parser("serve", help="web page with a copy button")
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--host", default="127.0.0.1", help="listen address (default: this machine only)")
@@ -702,6 +759,8 @@ def main():
         import shutil
         shutil.rmtree(INDEX_DIR / PARTIAL, ignore_errors=True)   # all saved in the index now
         print(f"Index written to {INDEX_DIR.resolve()}")
+    elif args.cmd == "bench":
+        bench(args.files, args.models, args.rerankers, args.n)
     elif args.cmd == "ask":
         idx = Index(reranker=None if args.no_rerank else args.reranker)
         res = idx.search(args.question, args.k, args.max_chars, since=args.since, source=args.source,

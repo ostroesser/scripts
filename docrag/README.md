@@ -55,25 +55,35 @@ The index goes to `./docrag_index` (change it with `DOCRAG_INDEX=/some/dir`).
 
 ## Models
 
-| Role | Default | Why |
-|---|---|---|
-| Embedding (`--model` at ingest) | `Qwen/Qwen3-Embedding-0.6B` | Best open model under 1B parameters for English retrieval (MTEB v2 retrieval 61.8, vs ~54 for the best small models). Apache 2.0. |
-| Reranker (`--reranker`) | `Qwen/Qwen3-Reranker-0.6B` | Re-reads the 20 best sections of each search and reorders them. Apache 2.0. |
+Defaults are sized for a laptop CPU:
 
-- **Indexing is CPU-heavy** with this model: the first full ingest of a large chat history can
-  take hours on a laptop. Later ingests only embed new or changed sections. Ingest shows its
-  speed and time left, and can be stopped (Ctrl+C) and resumed: finished blocks of 256 sections
-  are kept and the next run picks up where it stopped.
-- Models are loaded in float32: some (like Qwen3) are saved in bfloat16, which laptop CPUs
-  emulate several times slower.
-- **An existing index keeps the model it was built with**, so changing the model means a full
-  re-ingest (vectors from different models can't be mixed). To stay on a lighter model:
-  `ingest --model BAAI/bge-small-en-v1.5` (fast, English) or `--model intfloat/multilingual-e5-small`.
-- **Reranking** adds a few seconds per search on CPU. Turn it off per search with the
+| Role | Default | Size |
+|---|---|---|
+| Embedding (`ingest --model`) | `BAAI/bge-small-en-v1.5` | 33M parameters, ~130 MB |
+| Reranker (`serve`/`ask --reranker`) | `cross-encoder/ms-marco-MiniLM-L-6-v2` | 22M parameters, ~90 MB |
+
+**Measure before switching to a bigger model.** Cost grows with model size: on a laptop CPU,
+`Qwen/Qwen3-Embedding-0.6B` (the best under 1B on benchmarks) needs on the order of a second per
+section, i.e. many hours for a large chat history, and the Qwen3 reranker adds tens of seconds
+to each search. `bench` times candidates on a sample of your own sections:
+
+```bash
+python docrag.py bench docs/*.txt mm_export/*.jsonl
+python docrag.py bench docs/*.txt --models BAAI/bge-small-en-v1.5 BAAI/bge-base-en-v1.5 --rerankers BAAI/bge-reranker-base
+```
+
+It prints sections per second and the projected time to index everything for each embedding
+model, and the delay each reranker adds to a search. Models that can't be downloaded are skipped.
+
+- **An index keeps the model it was built with**, so changing the model means a full re-ingest
+  (vectors from different models can't be mixed). Ingest shows its speed and time left, and can
+  be stopped (Ctrl+C) and resumed: finished blocks of 256 sections are kept.
+- **Reranking** re-reads the 20 best sections and reorders them. Turn it off per search with the
   **Ranking** switch on the web page (Fast/Precise) or `ask --no-rerank`, or entirely with
   `serve --no-rerank`. If the reranker can't be loaded, searches still work, with a warning.
-- Models are downloaded on first use (about 1.2 GB each). After that they load from the local
-  cache in offline mode, without contacting Hugging Face. `DOCRAG_OFFLINE=1` forbids downloads.
+- Models are loaded in float32 (some are saved in bfloat16, which laptop CPUs emulate slowly),
+  downloaded on first use, then loaded from the local cache in offline mode without contacting
+  Hugging Face. `DOCRAG_OFFLINE=1` forbids downloads.
 **Certificate errors** during `pip install` or the model download: run
 `bash ../wsl-certs/import-windows-certs.sh` once. **Still blocked?** If the download is refused, get the model folder once
 from Hugging Face and pass its local path: `--model /path/to/model-folder` (same for `--reranker`).
