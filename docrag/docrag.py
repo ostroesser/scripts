@@ -3,6 +3,7 @@
 docrag — local retrieval over your scraped docs, for pasting into Copilot Chat.
 
   python docrag.py ingest export/*.txt mm_export/*.jsonl   # (re)build the index; unchanged parts are reused
+                                               # pass every file: --replace to drop ones already indexed
   python docrag.py ask "which base image for a Java 21 app?" --clip
   python docrag.py ask "..." --out context.md # file to attach in Copilot
   python docrag.py ask "ERR-4012 on rhel9-base" --keywords    # also match exact words
@@ -424,6 +425,15 @@ def reuse_embeddings(texts, model_name, paths=(INDEX_DIR,)):
     return [cache.get(text_hash(t)) for t in texts]
 
 
+def dropped_files(files, index_dir=INDEX_DIR):
+    """Export files in the existing index that this ingest doesn't include (it would remove them)."""
+    try:
+        old = {p["file"] for p in json.loads((Path(index_dir) / "pages.json").read_text(encoding="utf-8"))}
+    except (OSError, KeyError, ValueError):
+        return []
+    return sorted(old - {Path(f).name for f in files})
+
+
 def model_is_cached(name):
     """True if the model is a local folder or already in the Hugging Face cache."""
     if Path(name).is_dir():
@@ -604,6 +614,8 @@ def main():
     i.add_argument("--model", default=DEFAULT_MODEL)
     i.add_argument("--reuse", action="append", default=[], metavar="INDEX_DIR",
                    help="also take vectors from this index (repeatable), e.g. to merge indexes")
+    i.add_argument("--replace", action="store_true",
+                   help="allow removing files that are in the current index but not in this ingest")
     a = sub.add_parser("ask", help="retrieve pages for a question")
     a.add_argument("question")
     a.add_argument("-k", type=int, default=5, help="number of pages (default 5)")
@@ -624,6 +636,12 @@ def main():
     args = ap.parse_args()
 
     if args.cmd == "ingest":
+        dropped = dropped_files(args.files)
+        if dropped and not args.replace:
+            sys.exit(f"The index at {INDEX_DIR.resolve()} also holds these files, which are not in this ingest:\n"
+                     + "".join(f"  {f}\n" for f in dropped) +
+                     "ingest rebuilds the index from the files given, so they would be removed.\n"
+                     "Add them to the command, or pass --replace to remove them.")
         pages, chunks = build(args.files)
         print(f"{len(pages)} pages, {len(chunks)} sections from {len(args.files)} file(s); "
               f"embedding with {args.model} …")

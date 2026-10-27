@@ -44,6 +44,10 @@ python docrag.py ingest export/*.txt ../mmscrape/mm_export/*.jsonl
 Re-run `ingest` whenever you re-scrape. Sections whose text didn't change keep their vectors,
 so only new content is embedded.
 
+`ingest` rebuilds the index from the files you give it, so always pass all of them, not only
+the new ones. If the index holds files the command leaves out, ingest stops and lists them
+rather than removing them. Add `--replace` when removing them is what you want.
+
 To merge existing indexes into one without recomputing, ingest all the files into the new
 index and point `--reuse` at the old ones:
 

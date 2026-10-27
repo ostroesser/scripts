@@ -41,7 +41,7 @@ python mmscrape.py sync team/team-support                      # later runs: onl
 python mmscrape.py sync team/team-support --since 2023-01-01   # go further back: fetches the missing years
 python mmscrape.py sync https://<host>/team/channels/team-support other-team/other-channel
 
-python ../docrag/docrag.py ingest ../path/to/doc-export/*.txt mm_export/*.jsonl
+python ../docrag/docrag.py ingest ../path/to/doc-export/*.txt mm_export/*.jsonl ../confluencescrape/confluence_export/*.txt
 python ../docrag/docrag.py ask "deploy stuck on the deploy stage" --source "Team Support" --since 2026-01-01 --clip
 ```
 

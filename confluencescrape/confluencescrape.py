@@ -10,7 +10,8 @@ confluencescrape — download Confluence pages and render them for docrag.
   python confluencescrape.py fetch 'https://confluence.example.com/pages/viewpage.action?pageId=123456'
   python confluencescrape.py fetch 123456 --tree     # the page and every page below it
   python confluencescrape.py render                  # re-render everything fetched (no network)
-  python ../docrag/docrag.py ingest confluence_export/*.txt
+  python ../docrag/docrag.py ingest <doc exports>/*.txt ../mmscrape/mm_export/*.jsonl confluence_export/*.txt
+      # ingest rebuilds the index from the files given: always pass all of them
 
 Raw pages are kept in ./confluence_data (one JSON file per page). Exports go to ./confluence_export:
 one .txt file per space, in docrag's page-block format (Title, Source, markdown body).

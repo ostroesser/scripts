@@ -40,8 +40,12 @@ python confluencescrape.py fetch 'https://<host>/display/ENG/Base+Images' --tree
 python confluencescrape.py fetch 123456 789012
 python confluencescrape.py render          # rebuild the exports from confluence_data, no network
 
-python ../docrag/docrag.py ingest ../path/to/doc-export/*.txt confluence_export/*.txt
+python ../docrag/docrag.py ingest ../path/to/doc-export/*.txt ../mmscrape/mm_export/*.jsonl confluence_export/*.txt
 ```
+
+`ingest` rebuilds the index from the files you give it, so always pass every export you
+want searchable (docs, Mattermost, Confluence), not only the new ones. If you leave some
+out, it stops and lists them instead of removing them.
 
 Accepted page references: the page id, `…?pageId=123`, `…/spaces/KEY/pages/123/…` (Cloud) and
 `…/display/KEY/Page+Title`. Short links (`/x/AbCd`) aren't supported. Use
