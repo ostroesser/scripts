@@ -5,3 +5,5 @@ docrag_index/
 context.md
 mm_data/
 mm_export/
+confluence_data/
+confluence_export/
