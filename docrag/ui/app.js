@@ -195,7 +195,8 @@ const combo = {
 };
 
 // ------------------------------------------------------------------ filters
-const q = $("q"), since = $("since"), k = $("k"), size = $("size"), rerank = $("rerank");
+const q = $("q"), since = $("since"), k = $("k"), size = $("size"), rerank = $("rerank"),
+      keywords = $("keywords");
 
 function autoGrow() { q.style.height = "auto"; q.style.height = q.scrollHeight + "px"; }
 function showSize() {
@@ -203,10 +204,14 @@ function showSize() {
   $("size-out").textContent = `${fmtK(v)} characters, about ${fmtK(tokens(v))} tokens`;
 }
 function persist() {
-  save({ src: state.selected, since: since.value, k: k.value, size: size.value, rerank: rerank.checked });
+  save({ src: state.selected, since: since.value, k: k.value, size: size.value, rerank: rerank.checked,
+         keywords: keywords.checked });
 }
 function showRerank() {
   $("rerank-text").textContent = rerank.checked ? "Precise" : "Fast";
+}
+function showKeywords() {
+  $("keywords-text").textContent = keywords.checked ? "Meaning + keywords" : "Meaning";
 }
 function clampK() { k.value = Math.max(1, Math.min(50, parseInt(k.value, 10) || 5)); }
 
@@ -215,7 +220,8 @@ async function search() {
   const question = q.value.trim();
   if (!question) { q.focus(); return; }
   clampK();
-  const params = new URLSearchParams({ q: question, k: k.value, size: size.value, rerank: rerank.checked ? "1" : "0" });
+  const params = new URLSearchParams({ q: question, k: k.value, size: size.value, rerank: rerank.checked ? "1" : "0",
+                                      keywords: keywords.checked ? "1" : "0" });
   if (since.value) params.set("since", since.value);
   state.selected.forEach((s) => params.append("src", s));
   history.replaceState(null, "", "?" + params.toString());
@@ -369,6 +375,8 @@ async function init() {
   size.value = url.get("size") || saved.size || 24000;
   rerank.checked = url.has("rerank") ? url.get("rerank") !== "0" : saved.rerank !== false;
   showRerank();
+  keywords.checked = url.has("keywords") ? url.get("keywords") === "1" : saved.keywords === true;
+  showKeywords();
   state.selected = url.getAll("src").length ? url.getAll("src") : (saved.src || []);
   autoGrow();
   showSize();
@@ -389,6 +397,7 @@ async function init() {
   size.addEventListener("input", () => { showSize(); if (state.results.length) renderPacket(); });
   size.addEventListener("change", persist);
   rerank.addEventListener("change", () => { showRerank(); persist(); });
+  keywords.addEventListener("change", () => { showKeywords(); persist(); });
 
   try {
     const r = await fetch("/api/sources");

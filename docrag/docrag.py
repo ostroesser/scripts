@@ -5,6 +5,7 @@ docrag — local retrieval over your scraped docs, for pasting into Copilot Chat
   python docrag.py ingest export/*.txt mm_export/*.jsonl   # (re)build the index; unchanged parts are reused
   python docrag.py ask "which base image for a Java 21 app?" --clip
   python docrag.py ask "..." --out context.md # file to attach in Copilot
+  python docrag.py ask "ERR-4012 on rhel9-base" --keywords    # also match exact words
   python docrag.py ask "..." --source "Team Support" --since 2026-01-01   # filter chat threads
   python docrag.py serve                      # small web page at http://localhost:8765
 
@@ -14,8 +15,8 @@ with one page per line (title, url, text, optional date and source), such as
 mmscrape's chat threads. Results are whole pages with their title and URL. Pages too big to send
 whole are cut on their headings, and only the matching parts are sent.
 
-Search is hybrid: BM25 for exact terms (image names, properties, error codes)
-plus local embeddings for meaning, merged with reciprocal rank fusion.
+Search ranks by meaning (local embeddings). With --keywords, BM25 also ranks exact terms
+(image names, properties, error codes) and both are merged with reciprocal rank fusion.
 Matching runs on sections, so long pages are not truncated by the embedding
 model. Nothing leaves your machine, and no LLM is involved.
 """
@@ -30,7 +31,7 @@ INDEX_DIR = Path(os.environ.get("DOCRAG_INDEX", "./docrag_index"))
 # Small models: fast on a laptop CPU
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"           # 33M params, fast, good English retrieval
 DEFAULT_RERANKER = "cross-encoder/ms-marco-MiniLM-L-6-v2"   # 22M params, ~1 s per search
-RERANK_CANDIDATES = 100                            # sections the reranker re-reads per question
+RERANK_CANDIDATES = 20                             # sections the reranker re-reads per question
 MAX_TOKENS = 512                                   # sections are short; caps CPU time per section
 MAX_CHUNK = 1800       # chars per searchable section (the model reads ~512 tokens)
 MIN_CHUNK = 250        # tiny sections get merged with their neighbour
@@ -288,8 +289,10 @@ class Index:
                 print("warning:", self.rerank_error, file=sys.stderr)
         return self._reranker
 
-    def search(self, question, k=5, max_chars=None, since=None, source=None, groups=None, rerank=False):
+    def search(self, question, k=5, max_chars=None, since=None, source=None, groups=None, rerank=False,
+               keywords=False):
         """Return up to k pages: whole when small enough, else only their matching sections.
+        keywords: also rank by exact words (BM25), fused with the meaning ranking. Off: meaning only.
         since:  chat threads only: keep those active on/after YYYY-MM-DD (docs are not affected).
         source: keep pages whose source, label or file name contains this text.
         groups: keep pages of these sources ("docs:<file>", "chat:<team/channel>", or
@@ -310,24 +313,30 @@ class Index:
         idx = np.flatnonzero(allowed)
         if not len(idx):
             return []
-        bm = self.bm25.scores(tokenize(question))[idx]
         qv = embed(self.model, self.model_name, [question], is_query=True)[0]
         vec = self.emb[idx] @ qv
-        rrf = np.zeros(len(idx))               # reciprocal rank fusion of both rankings
-        for scores in (bm, vec):
-            order = np.argsort(-scores)
-            rrf[order] += 1.0 / (60 + np.arange(1, len(idx) + 1))
-
-        ranked = idx[np.argsort(-rrf)]
+        if keywords:                           # reciprocal rank fusion of meaning and exact words
+            rrf = np.zeros(len(idx))
+            for scores in (self.bm25.scores(tokenize(question))[idx], vec):
+                order = np.argsort(-scores)
+                rrf[order] += 1.0 / (60 + np.arange(1, len(idx) + 1))
+            ranked = idx[np.argsort(-rrf)]
+        else:
+            ranked = idx[np.argsort(-vec)]
         self.last_reranked = False
         if rerank and len(ranked) > 1:         # re-read the best candidates and reorder them
             rr = self.reranker()
             if rr is not None:
-                n = max(RERANK_CANDIDATES, k * 5)      # enough candidates for the pages asked for
+                n = max(RERANK_CANDIDATES, k * 3)      # enough candidates for the pages asked for
                 head = ranked[:n]
                 scores = rr.score(question, [f"{self.chunk_header(self.chunks[i])}\n{self.chunks[i]['text']}"
                                              for i in head])
-                ranked = np.concatenate([head[np.argsort(-scores, kind="stable")], ranked[n:]])
+                # Blend the reranker's order with the first one instead of replacing it: the
+                # reranker (trained on web keyword queries) refines, the meaning ranking still counts.
+                steps = 1.0 / (60 + np.arange(1, len(head) + 1))
+                fused = steps.copy()
+                fused[np.argsort(-scores, kind="stable")] += steps
+                ranked = np.concatenate([head[np.argsort(-fused, kind="stable")], ranked[n:]])
                 self.last_reranked = True
 
         hits = {}                              # k best pages -> all their chunks, most relevant first
@@ -531,7 +540,7 @@ STATIC = {"/": ("index.html", "text/html"), "/app.css": ("app.css", "text/css"),
 def serve(index, port, host="127.0.0.1"):
     """Web UI + JSON API:
       GET /api/sources                  -> {"sources": [...], "pages": n, "sections": n}
-      GET /api/search?q=&k=&size=&since=&src=<key>&src=<key>
+      GET /api/search?q=&k=&size=&since=&keywords=0|1&rerank=0|1&src=<key>&src=<key>
                                         -> {"header": str, "results": [{..., "block": str}]}"""
     class H(BaseHTTPRequestHandler):
         def send(self, code, body, ctype):
@@ -564,7 +573,7 @@ def serve(index, port, host="127.0.0.1"):
                     res = index.search(q, k=max(1, min(int(arg("k", "5") or 5), 50)),
                                        max_chars=max(1000, int(arg("size", str(MAX_CHARS)) or MAX_CHARS)),
                                        since=arg("since") or None, groups=qs.get("src") or None,
-                                       rerank=want_rerank)
+                                       rerank=want_rerank, keywords=arg("keywords", "0") == "1")
                     return self.send_json({
                         "header": context_header(q), "seconds": round(time.time() - t0, 2),
                         "reranked": index.last_reranked, "rerank_available": bool(index.reranker_name),
@@ -603,6 +612,8 @@ def main():
     a.add_argument("--source", help="only pages whose source/doc name/file contains this text")
     a.add_argument("--out", help="write to a file (e.g. context.md) to attach in Copilot")
     a.add_argument("--clip", action="store_true", help="copy to the Windows clipboard")
+    a.add_argument("--keywords", action="store_true",
+                   help="also match exact words (identifiers, error codes), not only the meaning")
     a.add_argument("--no-rerank", action="store_true", help="skip the reranker (faster, less precise)")
     a.add_argument("--reranker", default=DEFAULT_RERANKER, help="reranker model (default %(default)s)")
     s = sub.add_parser("serve", help="web page with a copy button")
@@ -652,7 +663,7 @@ def main():
     elif args.cmd == "ask":
         idx = Index(reranker=None if args.no_rerank else args.reranker)
         res = idx.search(args.question, args.k, args.max_chars, since=args.since, source=args.source,
-                         rerank=not args.no_rerank)
+                         rerank=not args.no_rerank, keywords=args.keywords)
         if idx.rerank_error:
             print("warning:", idx.rerank_error, "(results without reranking)", file=sys.stderr)
         ctx = format_context(args.question, res)

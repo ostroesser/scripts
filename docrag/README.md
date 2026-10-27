@@ -63,10 +63,11 @@ The index goes to `./docrag_index` (change it with `DOCRAG_INDEX=/some/dir`).
 - **An index keeps the model it was built with**, so changing the model means a full re-ingest
   (vectors from different models can't be mixed). Ingest shows its speed and time left, and can
   be stopped (Ctrl+C) and resumed: finished blocks of 256 sections are kept.
-- **Reranking** re-reads the 100 best sections with the question and reorders them, so a
-  relevant page the first pass ranked low can still reach the top. Turn it off
-  per search with the **Ranking** switch on the web page or `ask --no-rerank`, or entirely with
-  `serve --no-rerank`. If the reranker can't be loaded, searches still work, with a warning.
+- **Reranking** re-reads the 20 best sections with the question (more when you ask for over 6
+  pages) and refines their order: its ranking is blended with the first one, not substituted
+  for it. Turn it off per search with the **Ranking** switch on the web page or `ask --no-rerank`,
+  or entirely with `serve --no-rerank`. If the reranker can't be loaded, searches still work,
+  with a warning.
 - Models are downloaded on first use, then loaded from the local cache in offline mode, without
   contacting Hugging Face. `DOCRAG_OFFLINE=1` forbids downloads.
 **Certificate errors** during `pip install` or the model download: run
@@ -79,6 +80,7 @@ from Hugging Face and pass its local path: `--model /path/to/model-folder` (same
 python docrag.py ask "which base image for a Spring Boot app?" --clip     # → Windows clipboard
 python docrag.py ask "how do hardened images differ?" --out context.md    # → file to attach in Copilot
 python docrag.py ask "..." -k 8 --max-chars 40000                         # more pages / bigger budget
+python docrag.py ask "ERR-4012 on rhel9-base" --keywords                 # also match exact words
 python docrag.py ask "..." --source "Team Support" --since 2026-01-01   # only that channel, recent threads
 python docrag.py serve     # web page at http://localhost:8765 (see below)
 ```
@@ -101,6 +103,8 @@ Filters on the command line:
   several to combine them, or "All documentation" / "All Mattermost channels". Backspace
   removes the last one.
 - **Chat since**: only chat threads with activity on or after that date. Docs always pass.
+- **Match**: "Meaning" (default) ranks by what the question means. "Meaning + keywords" also
+  ranks by the exact words, for identifiers, error codes or image names.
 - **Pages** and **Size**: how many pages, and the total size budget they share.
 - **Results**: untick a result to leave it out of the copy. The bar above shows how full the
   copy is, one segment per page (blue for docs, ochre for chat). "Preview" shows exactly
@@ -110,7 +114,7 @@ Filters on the command line:
   Light and dark follow your Windows theme.
 
 The page talks to two endpoints you can also script against: `GET /api/sources` and
-`GET /api/search?q=…&k=5&size=24000&since=YYYY-MM-DD&src=docs:<file>&src=chat:<team/channel>`
+`GET /api/search?q=…&k=5&size=24000&since=YYYY-MM-DD&keywords=0|1&rerank=0|1&src=docs:<file>&src=chat:<team/channel>`
 (`src=docs:*` / `src=chat:*` for all of a kind).
 
 ## How it works
@@ -122,9 +126,14 @@ The page talks to two endpoints you can also script against: `GET /api/sources` 
 - **Search runs on sections, not whole pages.** Sections are capped at 512 tokens, so
   embedding a whole page would ignore most of it. Each page is cut on its headings for
   matching, and the hits are grouped back by page.
-- **Hybrid search.** Exact terms (image names like `rhel9-base`, property keys, error codes) are
-  matched by keywords, and paraphrased questions by meaning. The reranker then re-reads the
-  100 best sections with the question and puts the ones that actually answer it first.
+- **Meaning first.** By default sections are ranked by embedding similarity only, which follows
+  what a question means rather than which words it uses. With keywords on (`--keywords`, or the
+  **Match** switch), BM25 also ranks them on exact terms (image names like `rhel9-base`,
+  property keys, error codes) and both rankings are merged. On a public benchmark of natural
+  questions over Q&A threads, keyword matching and the keyword-trained reranker both pulled
+  results away from the meaning, hence this default.
+- **Reranking** then re-reads the 20 best sections with the question. Its order is blended
+  with the first one, so it refines the ranking rather than overriding it.
 - **Doc titles lose the site name** that doc sites append to every page ("Page - Site"),
   when every page of an export has the same suffix.
 - **Markdown links are reduced to their label** (`[Java Images](https://…)` → `Java Images`).
