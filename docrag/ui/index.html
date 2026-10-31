@@ -13,10 +13,25 @@
 </header>
 
 <main>
-  <form id="ask" class="ask" autocomplete="off">
-    <label for="q" class="visually-hidden">Question</label>
-    <textarea id="q" rows="1" placeholder="Ask about the docs or the channels…" required></textarea>
-    <button type="submit" id="go" class="btn btn-ink">Search</button>
+  <form id="ask" autocomplete="off">
+    <div class="ask">
+      <label for="q" class="visually-hidden">Question</label>
+      <textarea id="q" rows="1" placeholder="Ask about the docs or the channels…" required></textarea>
+      <div class="ask-actions">
+        <button type="submit" id="go" class="btn btn-ink">Search</button>
+        <button type="button" id="brief" class="btn btn-quiet"
+                title="Copies a prompt asking Copilot to write the search queries">Brief for Copilot</button>
+      </div>
+    </div>
+    <div class="field field-queries">
+      <div class="queries-label">
+        <label class="field-label" for="queries">Search queries, one per line (optional)</label>
+        <button type="button" id="queries-clear" class="linkish" hidden>Clear</button>
+      </div>
+      <textarea id="queries" class="input" rows="2" aria-describedby="queries-help"
+                placeholder="Empty: the question is the search"></textarea>
+      <span class="visually-hidden" id="queries-help">Enter searches. Shift+Enter starts a new line.</span>
+    </div>
   </form>
 
   <section class="filters" aria-label="Filters">
@@ -81,6 +96,7 @@
       <p class="packet-text" id="packet-text"></p>
       <button type="button" class="btn btn-ink" id="copy">Copy for Copilot</button>
     </div>
+    <ol class="query-legend" id="query-legend" aria-label="Search queries" hidden></ol>
   </section>
 
   <p class="notice" id="notice" role="status" hidden></p>

@@ -12,7 +12,12 @@ const state = {
   results: [],          // last search results
   header: "",
   off: new Set(),       // indexes of unticked results
+  queries: [],          // queries the last search ran
+  notices: [],          // what the server has to say about them
+  brief: "",            // prompt template, from the server
+  autoKeywords: false,  // the Match switch is on only because queries were entered
 };
+const MAX_QUERIES = 8;  // MAX_QUERIES in docrag.py; only for the button label, the server applies it
 
 // ------------------------------------------------------------------ helpers
 const fmtK = (n) => (n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1).replace(/\.0$/, "") + "k" : String(n));
@@ -195,17 +200,53 @@ const combo = {
 };
 
 // ------------------------------------------------------------------ filters
-const q = $("q"), since = $("since"), k = $("k"), size = $("size"), rerank = $("rerank"),
+const q = $("q"), queries = $("queries"), since = $("since"), k = $("k"), size = $("size"), rerank = $("rerank"),
       keywords = $("keywords");
 
-function autoGrow() { q.style.height = "auto"; q.style.height = q.scrollHeight + "px"; }
+function autoGrow() {
+  q.style.height = "auto"; q.style.height = q.scrollHeight + "px";
+  queries.style.height = "auto"; queries.style.height = queries.scrollHeight + 2 + "px";   // + its border
+}
+function queryLines() {
+  // same cleaning as clean_queries() in docrag.py, without the cap
+  const seen = new Set();
+  return queries.value.split("\n").map((l) => l.trim().replace(/\s+/g, " ")).filter((l) => {
+    const key = l.toLowerCase();
+    if (!l || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+function showQueries() {
+  const n = Math.min(queryLines().length, MAX_QUERIES);
+  $("go").textContent = n ? `Search ${n} quer${n === 1 ? "y" : "ies"}` : "Search";
+  $("queries-clear").hidden = !queries.value;
+}
+function queriesChanged() {
+  // Short queries with exact names need keyword matching: on while there are queries,
+  // back off with them if that's the only reason it was on. The switch still has the last word.
+  const has = queryLines().length > 0;
+  if (has && !keywords.checked) {
+    keywords.checked = true;
+    state.autoKeywords = true;
+  } else if (!has && state.autoKeywords) {
+    keywords.checked = false;
+    state.autoKeywords = false;
+  }
+  showKeywords();
+  showQueries();
+  autoGrow();
+  persist();
+}
 function showSize() {
   const v = +size.value;
   $("size-out").textContent = `${fmtK(v)} characters, about ${fmtK(tokens(v))} tokens`;
 }
 function persist() {
   save({ src: state.selected, since: since.value, k: k.value, size: size.value, rerank: rerank.checked,
-         keywords: keywords.checked });
+         keywords: keywords.checked, autoKeywords: state.autoKeywords,
+         // saved as a pair, so that queries never come back without the question they were written for
+         queries: queries.value, question: queries.value ? q.value : "" });
 }
 function showRerank() {
   $("rerank-text").textContent = rerank.checked ? "Precise" : "Fast";
@@ -222,6 +263,7 @@ async function search() {
   clampK();
   const params = new URLSearchParams({ q: question, k: k.value, size: size.value, rerank: rerank.checked ? "1" : "0",
                                       keywords: keywords.checked ? "1" : "0" });
+  queryLines().forEach((line) => params.append("query", line));
   if (since.value) params.set("since", since.value);
   state.selected.forEach((s) => params.append("src", s));
   history.replaceState(null, "", "?" + params.toString());
@@ -242,16 +284,20 @@ async function search() {
     state.seconds = data.seconds;
     state.reranked = data.reranked;
     state.warning = data.warning;
+    state.queries = data.queries;
+    state.notices = data.notices;
     state.off = new Set();
     renderResults();
   } catch (e) {
     state.results = [];
+    state.queries = [];
+    state.notices = [];
     renderResults();
     notice(`Search failed: ${e.message}. Check the terminal running docrag serve.`, true);
   } finally {
     clearTimeout(slow);
     go.disabled = false;
-    go.textContent = "Search";
+    showQueries();
   }
 }
 
@@ -274,8 +320,10 @@ function displayTitle(r) {
 function renderResults() {
   const list = $("results");
   list.replaceChildren();
-  notice(state.warning ? `Results without precise ranking: ${state.warning}` : "", !!state.warning);
+  notice([state.warning && `Results without precise ranking: ${state.warning}`, ...state.notices].filter(Boolean).join(" "),
+         !!state.warning);
   $("packet").hidden = !state.results.length;
+  renderLegend();
   if (!state.results.length) {
     if (q.value.trim()) notice("No pages match. Remove a source, or move the chat date further back.");
     return;
@@ -291,7 +339,10 @@ function renderResults() {
     });
 
     const head = el("div", "result-head");
-    head.append(el("div", "result-source", `${KIND_NAME[r.kind]}: ${r.label}`), el("h2", "result-title", displayTitle(r)));
+    const top = el("div", "result-top");
+    top.append(el("div", "result-source", `${KIND_NAME[r.kind]}: ${r.label}`));
+    if (state.queries.length > 1) top.append(foundBy(r));
+    head.append(top, el("h2", "result-title", displayTitle(r)));
     const meta = el("div", "result-meta");
     if (r.date) meta.append(el("span", null, r.kind === "chat" ? `Last reply ${r.date}` : r.date));
     meta.append(el("span", null, `${r.whole ? "Whole page" : "Relevant extracts"}, ${fmtK(r.chars)} characters`));
@@ -318,6 +369,31 @@ function renderResults() {
   renderPacket();
 }
 
+function foundBy(r) {
+  const box = el("div", "badges");
+  box.setAttribute("role", "img");
+  box.setAttribute("aria-label", `Found by quer${r.found_by.length === 1 ? "y" : "ies"} ${r.found_by.map((n) => n + 1).join(", ")}`);
+  for (const n of r.found_by) {
+    const b = el("span", "badge", String(n + 1));
+    b.title = `Found by query ${n + 1}: ${state.queries[n]}`;
+    box.append(b);
+  }
+  return box;
+}
+
+function renderLegend() {
+  const legend = $("query-legend");
+  legend.replaceChildren();
+  legend.hidden = state.queries.length < 2;
+  if (legend.hidden) return;
+  const used = new Set(state.results.flatMap((r) => r.found_by));
+  state.queries.forEach((text, n) => {
+    const li = el("li", used.has(n) ? "" : "unused");
+    li.append(el("span", "badge", String(n + 1)), el("span", null, text));
+    legend.append(li);
+  });
+}
+
 function packetText() {
   const blocks = state.results
     .filter((_, i) => !state.off.has(i))
@@ -342,13 +418,13 @@ function renderPacket() {
   const strong = el("strong", null, `${kept.length} of ${state.results.length} pages`);
   t.append(strong, document.createTextNode(
     `, ${fmtK(total)} characters, about ${fmtK(tokens(total))} tokens (size ${fmtK(budget)})`
-    + (state.seconds != null ? `. Found in ${state.seconds.toFixed(1)} s${state.reranked ? " with precise ranking" : ""}.` : "")));
+    + (state.seconds != null ? `. Found in ${state.seconds.toFixed(1)} s`
+       + (state.queries.length > 1 ? ` with ${state.queries.length} queries` : "")
+       + `${state.reranked ? (state.queries.length > 1 ? " and" : " with") + " precise ranking" : ""}.` : "")));
   $("copy").disabled = !kept.length;
 }
 
-async function copyPacket() {
-  if (!state.results.length) return;
-  const text = packetText();
+async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
   } catch {
@@ -358,10 +434,28 @@ async function copyPacket() {
     document.execCommand("copy");
     ta.remove();
   }
-  const b = $("copy");
+}
+
+function flashCopied(b) {
+  const label = b.dataset.label || (b.dataset.label = b.textContent);
   b.textContent = "Copied";
   b.classList.add("btn-done");
-  setTimeout(() => { b.textContent = "Copy for Copilot"; b.classList.remove("btn-done"); }, 1800);
+  clearTimeout(b.flash);
+  b.flash = setTimeout(() => { b.textContent = label; b.classList.remove("btn-done"); }, 1800);
+}
+
+async function copyPacket() {
+  if (!state.results.length) return;
+  await copyText(packetText());
+  flashCopied($("copy"));
+}
+
+async function copyBrief() {
+  const question = q.value.trim();
+  if (!question) { q.focus(); notice("Type your question first: the brief includes it."); return; }
+  if (!state.brief) { notice("Couldn't load the brief. Is docrag serve still running?", true); return; }
+  await copyText(state.brief.replaceAll("{question}", () => question));
+  flashCopied($("brief"));
 }
 
 // ------------------------------------------------------------------ start
@@ -369,22 +463,33 @@ async function init() {
   combo.bind();
   const saved = loadSaved();
   const url = new URLSearchParams(location.search);
-  q.value = url.get("q") || "";
+  // A URL holding a search wins entirely: an old bookmark must not pick up saved queries.
+  const fromUrl = url.has("q") || url.has("query");
+  q.value = fromUrl ? url.get("q") || "" : saved.question || "";
+  queries.value = fromUrl ? url.getAll("query").join("\n") : saved.queries || "";
+  state.autoKeywords = !fromUrl && saved.autoKeywords === true;
   since.value = url.get("since") ?? saved.since ?? "";
   k.value = url.get("k") || saved.k || 5;
   size.value = url.get("size") || saved.size || 24000;
   rerank.checked = url.has("rerank") ? url.get("rerank") !== "0" : saved.rerank !== false;
   showRerank();
-  keywords.checked = url.has("keywords") ? url.get("keywords") === "1" : saved.keywords === true;
+  keywords.checked = url.has("keywords") ? url.get("keywords") === "1"
+    : url.has("query") || saved.keywords === true;
   showKeywords();
   state.selected = url.getAll("src").length ? url.getAll("src") : (saved.src || []);
   autoGrow();
   showSize();
+  showQueries();
 
-  q.addEventListener("input", autoGrow);
-  q.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey) { e.preventDefault(); search(); }
-  });
+  q.addEventListener("input", () => { autoGrow(); persist(); });
+  queries.addEventListener("input", queriesChanged);
+  for (const t of [q, queries]) {
+    t.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey) { e.preventDefault(); search(); }
+    });
+  }
+  $("queries-clear").addEventListener("click", () => { queries.value = ""; queriesChanged(); queries.focus(); });
+  $("brief").addEventListener("click", copyBrief);
   $("ask").addEventListener("submit", (e) => { e.preventDefault(); search(); });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); copyPacket(); }
@@ -397,12 +502,13 @@ async function init() {
   size.addEventListener("input", () => { showSize(); if (state.results.length) renderPacket(); });
   size.addEventListener("change", persist);
   rerank.addEventListener("change", () => { showRerank(); persist(); });
-  keywords.addEventListener("change", () => { showKeywords(); persist(); });
+  keywords.addEventListener("change", () => { state.autoKeywords = false; showKeywords(); persist(); });
 
   try {
     const r = await fetch("/api/sources");
     const data = await r.json();
     state.sources = data.sources;
+    state.brief = data.brief_template || "";
     if (!data.reranker) $("rerank-field").hidden = true;   // server started with --no-rerank
     const known = new Set(state.sources.map((s) => s.key).concat(Object.values(ALL)));
     state.selected = state.selected.filter((key) => known.has(key));
@@ -414,6 +520,6 @@ async function init() {
     $("stats").textContent = "Couldn't load the index. Is docrag serve still running?";
   }
   combo.renderChips();
-  if (q.value) search(); else q.focus();
+  if (fromUrl && q.value) search(); else q.focus();
 }
 init();

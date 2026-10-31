@@ -67,6 +67,15 @@ main { max-width: 980px; margin: 0 auto; padding: 0 24px 64px; }
 .ask textarea::placeholder { color: var(--muted); opacity: .55; }
 .ask textarea:focus-visible { outline: none; }
 .ask:focus-within { border-bottom-color: var(--focus); }
+.ask-actions { display: flex; flex-direction: column; gap: 6px; }
+.field-queries { margin-top: 14px; }
+.queries-label { display: flex; justify-content: space-between; gap: 16px; font-size: 13px; color: var(--muted); }
+.field-queries textarea {
+  height: auto; min-height: 58px; padding: 8px 10px; resize: none; overflow: hidden;
+  font: 14px/1.45 var(--ui); width: 100%; display: block;
+}
+.field-queries textarea::placeholder { color: var(--muted); }
+.field-queries textarea:focus-visible { outline: none; border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus); }
 
 /* ---------- buttons */
 .btn {
@@ -77,6 +86,9 @@ main { max-width: 980px; margin: 0 auto; padding: 0 24px 64px; }
 .btn-ink:hover { filter: brightness(1.15); }
 .btn-ink:disabled { opacity: .5; cursor: progress; }
 .btn-done { background: var(--docs); }
+.btn-quiet { background: var(--paper); color: var(--ink); border-color: var(--line); }
+.btn-quiet:hover { border-color: var(--ink); }
+.btn-quiet.btn-done { background: var(--docs); color: var(--paper); border-color: var(--docs); }
 
 /* ---------- filters */
 .filters {
@@ -105,7 +117,7 @@ main { max-width: 980px; margin: 0 auto; padding: 0 24px 64px; }
 .switch { display: inline-flex; align-items: center; gap: 8px; height: 38px; cursor: pointer; }
 .switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
 .switch .track {
-  position: relative; width: 34px; height: 20px; border-radius: 10px;
+  position: relative; flex-shrink: 0; width: 34px; height: 20px; border-radius: 10px;
   background: var(--line); transition: background .15s;
 }
 .switch .track::after {
@@ -189,6 +201,17 @@ main { max-width: 980px; margin: 0 auto; padding: 0 24px 64px; }
 .packet-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 12px; }
 .packet-text { margin: 0; color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; }
 .packet-text strong { color: var(--ink); font-weight: 600; }
+.query-legend {
+  display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 10px 0 0; padding: 0; list-style: none;
+  font-size: 13px; color: var(--muted);
+}
+.query-legend li { display: flex; align-items: baseline; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.query-legend li.unused { opacity: .6; }
+.badge {
+  display: inline-block; min-width: 18px; padding: 0 4px; border-radius: 4px; text-align: center;
+  border: 1px solid var(--line); color: var(--muted); background: var(--fog);
+  font: 600 12px/16px var(--ui); font-variant-numeric: tabular-nums;
+}
 
 /* ---------- results */
 .notice { margin: 28px 0 0; color: var(--muted); }
@@ -203,7 +226,9 @@ main { max-width: 980px; margin: 0 auto; padding: 0 24px 64px; }
 .result.off { opacity: .55; }
 .result input[type=checkbox] { margin: 4px 0 0; width: 16px; height: 16px; accent-color: var(--ink); cursor: pointer; }
 .result-head { min-width: 0; }
-.result-source { font-size: 13px; color: var(--docs); font-weight: 600; }
+.result-top { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.result-source { font-size: 13px; color: var(--docs); font-weight: 600; min-width: 0; }
+.badges { display: flex; flex-shrink: 0; gap: 4px; }
 .result.chat .result-source { color: var(--chat); }
 .result-title { margin: 2px 0 6px; font: 600 16px/1.35 var(--display); overflow-wrap: anywhere; }
 .result-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; font-size: 13px; color: var(--muted); }
@@ -224,7 +249,10 @@ main { max-width: 980px; margin: 0 auto; padding: 0 24px 64px; }
   main, .top { padding-left: 16px; padding-right: 16px; }
   .filters { grid-template-columns: 1fr 1fr 1fr; }
   .field-sources, .field-size { grid-column: 1 / -1; }
+  .ask { flex-direction: column; align-items: stretch; }
   .ask textarea { font-size: 24px; }
+  .ask-actions { flex-direction: row; }
+  .ask-actions .btn { flex: 1; }
   .packet-bar { flex-direction: column; align-items: stretch; }
 }
 @media (prefers-reduced-motion: no-preference) {
