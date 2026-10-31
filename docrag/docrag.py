@@ -8,6 +8,8 @@ docrag — local retrieval over your scraped docs, for pasting into Copilot Chat
   python docrag.py ask "..." --out context.md # file to attach in Copilot
   python docrag.py ask "ERR-4012 on rhel9-base" --keywords    # also match exact words
   python docrag.py ask "..." --source "Team Support" --since 2026-01-01   # filter chat threads
+  python docrag.py ask "which driver for this DB?" --query "orders-db JDBC driver" --query "how to connect to orders-db"
+  python docrag.py brief "which driver for this DB?" --clip   # prompt asking Copilot to write those queries
   python docrag.py serve                      # small web page at http://localhost:8765
 
 The page is the unit of output. Inputs are text exports where the page blocks
@@ -33,10 +35,52 @@ INDEX_DIR = Path(os.environ.get("DOCRAG_INDEX", "./docrag_index"))
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"           # 33M params, fast, good English retrieval
 DEFAULT_RERANKER = "cross-encoder/ms-marco-MiniLM-L-6-v2"   # 22M params, ~1 s per search
 RERANK_CANDIDATES = 20                             # sections the reranker re-reads per question
+MAX_QUERIES = 8                                    # search queries run per search; extra ones are left out
+RERANK_TOTAL = 40                                  # with several queries: sections re-read, shared between them
+RERANK_MIN_PER_QUERY = 5
+FOUND_BY_DEPTH = 10                                # a query "found" a page if it's in its top max(k, this) pages
 MAX_TOKENS = 512                                   # sections are short; caps CPU time per section
 MAX_CHUNK = 1800       # chars per searchable section (the model reads ~512 tokens)
 MIN_CHUNK = 250        # tiny sections get merged with their neighbour
 MAX_CHARS = 24000      # default total size budget of one answer (~6k tokens)
+
+# The prompt behind "Brief for Copilot" and `brief`. Edit freely; {question} is replaced by the question.
+BRIEF_TEMPLATE = """\
+I need search queries for a documentation and chat search tool called docrag. Don't answer the question yet.
+
+My question:
+{question}
+
+I may have attached a screenshot; treat it as part of the question.
+
+How docrag searches: it combines exact keyword matching with meaning-based matching. It works best with short, single-topic queries that use the exact names found in the docs.
+
+Write 3 to 5 search queries:
+- Copy every exact identifier visible in the screenshot or the question word for word: product and tool names, driver names and versions, URL schemes, database aliases, error messages, field labels.
+- Write one query per sub-question.
+- Mix keyword-style queries with queries phrased like a question a colleague would post in a support channel.
+- Use no quotes and no boolean operators.
+- Keep each query under 15 words.
+
+Output only the queries, one per line, with no numbering and no commentary.
+"""
+
+
+def brief_text(question):
+    return BRIEF_TEMPLATE.replace("{question}", question.strip())
+
+
+def clean_queries(queries):
+    """Usable search queries: blanks and duplicates dropped, capped at MAX_QUERIES.
+    Returns (kept, how many were left out by the cap)."""
+    kept, seen = [], set()
+    for q in queries or ():
+        q = " ".join(q.split())
+        if q and q.lower() not in seen:
+            seen.add(q.lower())
+            kept.append(q)
+    return kept[:MAX_QUERIES], max(0, len(kept) - MAX_QUERIES)
+
 
 # ---------------------------------------------------------------- parsing
 PAGE_BLOCK = re.compile(
@@ -257,9 +301,23 @@ class Index:
         self._reranker = None
         self.rerank_error = None
         self.last_reranked = False
+        self.last_queries = []                    # the queries the last search ran
+        self.last_left_out = 0                    # queries beyond MAX_QUERIES
+        self.last_unused = []                     # queries none of the returned pages came from
         NEEDED_MODELS.add(self.model_name)
         if reranker:
             NEEDED_MODELS.add(reranker)
+
+    def query_notices(self):
+        """What the user should know about the queries of the last search."""
+        out = []
+        if self.last_left_out:
+            out.append(f"Only the first {MAX_QUERIES} queries ran; {self.last_left_out} left out.")
+        if self.last_unused:
+            nums = ", ".join(str(n + 1) for n in self.last_unused)
+            out.append(f"Quer{'ies' if len(self.last_unused) > 1 else 'y'} {nums} contributed no page; "
+                       "raise Pages to include more.")
+        return out
 
     def sources(self):
         """Filterable sources: one entry per docs export file and per chat channel."""
@@ -290,9 +348,38 @@ class Index:
                 print("warning:", self.rerank_error, file=sys.stderr)
         return self._reranker
 
+    def rank(self, query, qv, idx, keywords, rerank_n):
+        """Allowed sections (idx) for one query, best first. rerank_n: sections the reranker re-reads."""
+        vec = self.emb[idx] @ qv
+        if keywords:                           # reciprocal rank fusion of meaning and exact words
+            rrf = np.zeros(len(idx))
+            for scores in (self.bm25.scores(tokenize(query))[idx], vec):
+                order = np.argsort(-scores)
+                rrf[order] += 1.0 / (60 + np.arange(1, len(idx) + 1))
+            ranked = idx[np.argsort(-rrf)]
+        else:
+            ranked = idx[np.argsort(-vec)]
+        if rerank_n and len(ranked) > 1:       # re-read the best candidates and reorder them
+            rr = self.reranker()
+            if rr is not None:
+                head = ranked[:rerank_n]
+                scores = rr.score(query, [f"{self.chunk_header(self.chunks[i])}\n{self.chunks[i]['text']}"
+                                          for i in head])
+                # Blend the reranker's order with the first one instead of replacing it: the
+                # reranker (trained on web keyword queries) refines, the meaning ranking still counts.
+                steps = 1.0 / (60 + np.arange(1, len(head) + 1))
+                fused = steps.copy()
+                fused[np.argsort(-scores, kind="stable")] += steps
+                ranked = np.concatenate([head[np.argsort(-fused, kind="stable")], ranked[rerank_n:]])
+                self.last_reranked = True
+        return ranked
+
     def search(self, question, k=5, max_chars=None, since=None, source=None, groups=None, rerank=False,
-               keywords=False):
+               keywords=False, queries=None):
         """Return up to k pages: whole when small enough, else only their matching sections.
+        queries: search with these instead of the question. Each is ranked (and reranked) on its own,
+                then their page rankings are merged, so a page found by several ranks higher.
+                Each result says which queries found it in "found_by" (0-based positions in last_queries).
         keywords: also rank by exact words (BM25), fused with the meaning ranking. Off: meaning only.
         since:  chat threads only: keep those active on/after YYYY-MM-DD (docs are not affected).
         source: keep pages whose source, label or file name contains this text.
@@ -300,6 +387,9 @@ class Index:
                 "docs:*" / "chat:*" for all of a kind); several are combined with OR."""
         max_chars = max_chars or MAX_CHARS
         groups = set(groups or ())
+        queries, self.last_left_out = clean_queries(queries)
+        queries = queries or [question]
+        self.last_queries, self.last_unused, self.last_reranked = queries, [], False
         page_ok = []
         for p in self.pages:
             ok = True
@@ -314,40 +404,44 @@ class Index:
         idx = np.flatnonzero(allowed)
         if not len(idx):
             return []
-        qv = embed(self.model, self.model_name, [question], is_query=True)[0]
-        vec = self.emb[idx] @ qv
-        if keywords:                           # reciprocal rank fusion of meaning and exact words
-            rrf = np.zeros(len(idx))
-            for scores in (self.bm25.scores(tokenize(question))[idx], vec):
-                order = np.argsort(-scores)
-                rrf[order] += 1.0 / (60 + np.arange(1, len(idx) + 1))
-            ranked = idx[np.argsort(-rrf)]
+        # Enough candidates for the pages asked for. Several queries share a total, so that
+        # reranking costs about twice a single search rather than one more per query.
+        if not rerank:
+            rerank_n = 0
+        elif len(queries) == 1:
+            rerank_n = max(RERANK_CANDIDATES, k * 3)
         else:
-            ranked = idx[np.argsort(-vec)]
-        self.last_reranked = False
-        if rerank and len(ranked) > 1:         # re-read the best candidates and reorder them
-            rr = self.reranker()
-            if rr is not None:
-                n = max(RERANK_CANDIDATES, k * 3)      # enough candidates for the pages asked for
-                head = ranked[:n]
-                scores = rr.score(question, [f"{self.chunk_header(self.chunks[i])}\n{self.chunks[i]['text']}"
-                                             for i in head])
-                # Blend the reranker's order with the first one instead of replacing it: the
-                # reranker (trained on web keyword queries) refines, the meaning ranking still counts.
-                steps = 1.0 / (60 + np.arange(1, len(head) + 1))
-                fused = steps.copy()
-                fused[np.argsort(-scores, kind="stable")] += steps
-                ranked = np.concatenate([head[np.argsort(-fused, kind="stable")], ranked[n:]])
-                self.last_reranked = True
+            rerank_n = max(RERANK_MIN_PER_QUERY, max(RERANK_TOTAL, k * 3) // len(queries))
+        qvs = embed(self.model, self.model_name, queries, is_query=True)
+        rankings = [self.rank(q, qv, idx, keywords, rerank_n) for q, qv in zip(queries, qvs)]
 
-        hits = {}                              # k best pages -> all their chunks, most relevant first
-        for i in ranked:
-            pid = self.chunks[i]["page"]
-            if pid not in hits:
-                if len(hits) >= k:
-                    continue
-                hits[pid] = []
-            hits[pid].append(int(i))
+        # Reciprocal rank fusion of the queries' page rankings (reranker scores of different queries
+        # can't be compared, ranks can). Only a query's top pages count: every query ranks every page.
+        depth, page_score, found_by = max(k, FOUND_BY_DEPTH), {}, {}
+        for qn, ranked in enumerate(rankings):
+            seen = set()
+            for i in ranked:
+                pid = self.chunks[i]["page"]
+                if pid not in seen:
+                    seen.add(pid)
+                    page_score[pid] = page_score.get(pid, 0) + 1.0 / (60 + len(seen))
+                    found_by.setdefault(pid, []).append(qn)
+                    if len(seen) >= depth:
+                        break
+        best = sorted(page_score, key=page_score.get, reverse=True)[:k]   # stable: ties keep query order
+
+        # The k best pages -> all their chunks, most relevant first (for the queries that found the page)
+        chunk_score = {}
+        for qn, ranked in enumerate(rankings):
+            wanted = {pid for pid in best if qn in found_by[pid]}
+            for pos, i in enumerate(ranked, 1):
+                if self.chunks[i]["page"] in wanted:
+                    chunk_score[int(i)] = chunk_score.get(int(i), 0) + 1.0 / (60 + pos)
+        hits = {pid: [] for pid in best}
+        for i in sorted(chunk_score, key=chunk_score.get, reverse=True):
+            hits[self.chunks[i]["page"]].append(i)
+        used = {qn for pid in best for qn in found_by[pid]}
+        self.last_unused = [qn for qn in range(len(queries)) if qn not in used]
 
         # Share the size budget: pages are filled smallest first, each getting an equal share of
         # what's left, so unused space flows on to the bigger ones. A page bigger than its share
@@ -370,7 +464,8 @@ class Index:
                 bodies[pid] = (page["text"] if whole else
                                "\n\n[…]\n\n".join(self.chunks[c]["text"] for c in sorted(chosen)), whole)
             remaining -= len(bodies[pid][0])
-        results = [{**self.pages[pid], "text": bodies[pid][0], "whole": bodies[pid][1]} for pid in hits]
+        results = [{**self.pages[pid], "text": bodies[pid][0], "whole": bodies[pid][1],
+                    "found_by": found_by[pid]} for pid in hits]
         return results
 
 # ---------------------------------------------------------------- embeddings
@@ -550,8 +645,11 @@ STATIC = {"/": ("index.html", "text/html"), "/app.css": ("app.css", "text/css"),
 def serve(index, port, host="127.0.0.1"):
     """Web UI + JSON API:
       GET /api/sources                  -> {"sources": [...], "pages": n, "sections": n}
-      GET /api/search?q=&k=&size=&since=&keywords=0|1&rerank=0|1&src=<key>&src=<key>
-                                        -> {"header": str, "results": [{..., "block": str}]}"""
+      GET /api/search?q=&query=&query=&k=&size=&since=&keywords=0|1&rerank=0|1&src=<key>&src=<key>
+                                        -> {"header": str, "queries": [str], "notices": [str],
+                                            "results": [{..., "block": str, "found_by": [int]}]}
+    q is the question (first line of the copy). It is also the search, unless query= params are
+    given; those then imply keywords=1 unless keywords= says otherwise."""
     class H(BaseHTTPRequestHandler):
         def send(self, code, body, ctype):
             data = body if isinstance(body, bytes) else body.encode("utf-8")
@@ -573,25 +671,28 @@ def serve(index, port, host="127.0.0.1"):
                 if u.path == "/api/sources":
                     return self.send_json({"sources": index.sources(), "pages": len(index.pages),
                                            "sections": len(index.chunks), "model": index.model_name,
-                                           "reranker": index.reranker_name})
+                                           "reranker": index.reranker_name, "brief_template": BRIEF_TEMPLATE})
                 if u.path == "/api/search":
                     q = arg("q")
                     if not q:
                         return self.send_json({"error": "empty question"}, 400)
+                    queries = clean_queries(qs.get("query"))[0]
                     t0 = time.time()
                     want_rerank = arg("rerank", "1") != "0" and bool(index.reranker_name)
                     res = index.search(q, k=max(1, min(int(arg("k", "5") or 5), 50)),
                                        max_chars=max(1000, int(arg("size", str(MAX_CHARS)) or MAX_CHARS)),
                                        since=arg("since") or None, groups=qs.get("src") or None,
-                                       rerank=want_rerank, keywords=arg("keywords", "0") == "1")
+                                       rerank=want_rerank, keywords=arg("keywords", "1" if queries else "0") == "1",
+                                       queries=qs.get("query"))
                     return self.send_json({
                         "header": context_header(q), "seconds": round(time.time() - t0, 2),
+                        "queries": index.last_queries, "notices": index.query_notices(),
                         "reranked": index.last_reranked, "rerank_available": bool(index.reranker_name),
                         "warning": index.rerank_error if want_rerank and not index.last_reranked else None,
                         "results": [
                         {"title": r["title"], "url": r["url"], "date": r.get("date", ""), "kind": r["kind"],
                          "label": r["label"], "whole": r["whole"], "chars": len(r["text"]),
-                         "text": r["text"], "block": result_block(n, r)}
+                         "text": r["text"], "block": result_block(n, r), "found_by": r["found_by"]}
                         for n, r in enumerate(res, 1)]})
                 if u.path in STATIC:
                     name, ctype = STATIC[u.path]
@@ -618,16 +719,23 @@ def main():
                    help="allow removing files that are in the current index but not in this ingest")
     a = sub.add_parser("ask", help="retrieve pages for a question")
     a.add_argument("question")
+    a.add_argument("--query", action="append", default=[], metavar="TEXT",
+                   help="search with this instead of the question (repeatable); results are merged")
+    a.add_argument("--queries-file", metavar="FILE", help="more search queries, one per line")
     a.add_argument("-k", type=int, default=5, help="number of pages (default 5)")
     a.add_argument("--max-chars", type=int, default=MAX_CHARS, help="total size budget (characters)")
     a.add_argument("--since", help="chat threads active on/after YYYY-MM-DD (docs are not affected)")
     a.add_argument("--source", help="only pages whose source/doc name/file contains this text")
     a.add_argument("--out", help="write to a file (e.g. context.md) to attach in Copilot")
     a.add_argument("--clip", action="store_true", help="copy to the Windows clipboard")
-    a.add_argument("--keywords", action="store_true",
-                   help="also match exact words (identifiers, error codes), not only the meaning")
+    a.add_argument("--keywords", action=argparse.BooleanOptionalAction, default=None,
+                   help="also match exact words (identifiers, error codes), not only the meaning "
+                        "(default: on with search queries, off without)")
     a.add_argument("--no-rerank", action="store_true", help="skip the reranker (faster, less precise)")
     a.add_argument("--reranker", default=DEFAULT_RERANKER, help="reranker model (default %(default)s)")
+    b = sub.add_parser("brief", help="print a prompt asking Copilot to write search queries for a question")
+    b.add_argument("question")
+    b.add_argument("--clip", action="store_true", help="copy to the Windows clipboard")
     s = sub.add_parser("serve", help="web page with a copy button")
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--host", default="127.0.0.1", help="listen address (default: this machine only)")
@@ -679,19 +787,37 @@ def main():
         shutil.rmtree(INDEX_DIR / PARTIAL, ignore_errors=True)   # all saved in the index now
         print(f"Index written to {INDEX_DIR.resolve()}")
     elif args.cmd == "ask":
+        queries = list(args.query)
+        if args.queries_file:
+            try:
+                queries += Path(args.queries_file).read_text(encoding="utf-8").split("\n")
+            except OSError as e:
+                sys.exit(f"Can't read the queries file: {e}")
+        keywords = bool(clean_queries(queries)[0]) if args.keywords is None else args.keywords
         idx = Index(reranker=None if args.no_rerank else args.reranker)
         res = idx.search(args.question, args.k, args.max_chars, since=args.since, source=args.source,
-                         rerank=not args.no_rerank, keywords=args.keywords)
+                         rerank=not args.no_rerank, keywords=keywords, queries=queries)
         if idx.rerank_error:
             print("warning:", idx.rerank_error, "(results without reranking)", file=sys.stderr)
         ctx = format_context(args.question, res)
-        print("Pages: " + " | ".join(r["title"] for r in res), file=sys.stderr)
+        several = len(idx.last_queries) > 1
+        print("Pages: " + " | ".join(
+            r["title"] + (" [" + ",".join(str(n + 1) for n in r["found_by"]) + "]" if several else "")
+            for r in res), file=sys.stderr)
+        for note in idx.query_notices():
+            print("note:", note, file=sys.stderr)
         if args.out:
             Path(args.out).write_text(ctx, encoding="utf-8"); print(f"Wrote {args.out} ({len(ctx):,} chars)")
         if args.clip:
             to_clipboard(ctx); print(f"Copied to clipboard ({len(ctx):,} chars)")
         if not (args.out or args.clip):
             print(ctx)
+    elif args.cmd == "brief":
+        text = brief_text(args.question)
+        if args.clip:
+            to_clipboard(text); print(f"Copied to clipboard ({len(text):,} chars)")
+        else:
+            print(text)
     else:
         serve(Index(reranker=None if args.no_rerank else args.reranker), args.port, args.host)
 
