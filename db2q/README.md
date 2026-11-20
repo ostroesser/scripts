@@ -56,7 +56,27 @@ jbang db2q.java --max 1000 "SELECT ..."
 
 ## Hook it up to the agent
 
-In the project's agent instructions (e.g. `.github/copilot-instructions.md`):
+### Copilot skill (recommended)
+
+[copilot-skill/db2-query](copilot-skill/db2-query/) is an agent skill: `SKILL.md` tells
+Copilot how and when to query (explore first, small read-only queries, DB2 for z/OS SQL,
+error codes), and `db2q.sh` gives it one fixed command to run.
+
+```bash
+mkdir -p ~/.copilot/skills
+cp -r copilot-skill/db2-query ~/.copilot/skills/
+# only if db2q.java isn't at ~/scripts/db2q/db2q.java:
+echo 'export DB2Q_JAVA=/path/to/db2q.java' >> ~/.bashrc
+# only if your JVM needs extra options:
+echo 'export DB2Q_JVM_OPTS="-XX:ActiveProcessorCount=8"' >> ~/.bashrc
+```
+
+Check with `/skills` in Copilot Chat, then auto-approve only the wrapper in VS Code
+(`chat.tools.terminal.autoApprove`: `"/db2-query\\/db2q\\.sh/": true`).
+
+### Plain instructions
+
+Without skills, in the project's agent instructions (e.g. `.github/copilot-instructions.md`):
 
 > To query the database, run `jbang <path>/db2q.java "<SQL>"`. Explore with `--tables` and
 > `--describe TABLE` before writing queries. Always add `FETCH FIRST n ROWS ONLY` and `WITH UR`.
