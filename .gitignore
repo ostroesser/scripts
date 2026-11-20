@@ -7,3 +7,4 @@ mm_data/
 mm_export/
 confluence_data/
 confluence_export/
+db2q.env
